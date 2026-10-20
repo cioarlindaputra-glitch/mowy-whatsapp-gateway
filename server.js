@@ -5,6 +5,7 @@ import { createClient } from '@supabase/supabase-js'
 import { Boom } from '@hapi/boom'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 const required = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'OPENAI_API_KEY', 'WA_ALLOWED_EMAIL']
 const missing = required.filter((key) => !process.env[key])
@@ -16,6 +17,8 @@ const appOrigin = (process.env.APP_ORIGIN || '').replace(/\/$/, '')
 const sessionDir = process.env.WA_SESSION_DIR || './data/whatsapp-session'
 const knowledgeFile = path.join(path.dirname(sessionDir), 'mowy-knowledge-documents.json')
 const inboxFile = path.join(path.dirname(sessionDir), 'mowy-inbox.json')
+const leadsFile = path.join(path.dirname(sessionDir), 'mowy-leads.json')
+const appointmentsFile = path.join(path.dirname(sessionDir), 'mowy-appointments.json')
 const authClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } })
 const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
@@ -62,6 +65,26 @@ try {
   }
 } catch {}
 if (!inboxOwnerId && ownerUserId) inboxOwnerId = ownerUserId
+let leadsOwnerId = null
+const leads = new Map()
+try {
+  const saved = JSON.parse(await fs.readFile(leadsFile, 'utf8'))
+  leadsOwnerId = typeof saved.ownerUserId === 'string' ? saved.ownerUserId : null
+  if (Array.isArray(saved.leads)) for (const lead of saved.leads) {
+    if (typeof lead?.id === 'string' && typeof lead?.jid === 'string') leads.set(lead.id, lead)
+  }
+} catch {}
+if (!leadsOwnerId && ownerUserId) leadsOwnerId = ownerUserId
+let appointmentsOwnerId = null
+const appointments = new Map()
+try {
+  const saved = JSON.parse(await fs.readFile(appointmentsFile, 'utf8'))
+  appointmentsOwnerId = typeof saved.ownerUserId === 'string' ? saved.ownerUserId : null
+  if (Array.isArray(saved.appointments)) for (const appointment of saved.appointments) {
+    if (typeof appointment?.id === 'string') appointments.set(appointment.id, appointment)
+  }
+} catch {}
+if (!appointmentsOwnerId && ownerUserId) appointmentsOwnerId = ownerUserId
 try {
   const optedOut = JSON.parse(await fs.readFile(path.join(sessionDir, 'opt-outs.json'), 'utf8'))
   if (Array.isArray(optedOut)) for (const jid of optedOut) if (typeof jid === 'string') optedOutJids.add(jid)
@@ -110,6 +133,24 @@ function requireInboxOwner(req, res) {
   return true
 }
 
+function requireLeadOwner(req, res) {
+  if (!leadsOwnerId) leadsOwnerId = req.mowyUser.id
+  if (leadsOwnerId && leadsOwnerId !== req.mowyUser.id) {
+    res.status(403).json({ error: 'Data lead sudah dimiliki akun workspace lain.' })
+    return false
+  }
+  return true
+}
+
+function requireAppointmentOwner(req, res) {
+  if (!appointmentsOwnerId) appointmentsOwnerId = req.mowyUser.id
+  if (appointmentsOwnerId && appointmentsOwnerId !== req.mowyUser.id) {
+    res.status(403).json({ error: 'Jadwal survei sudah dimiliki akun workspace lain.' })
+    return false
+  }
+  return true
+}
+
 let inboxWrite = Promise.resolve()
 function persistInbox() {
   const snapshot = { ownerUserId: inboxOwnerId, chats: [...inboxChats.values()] }
@@ -120,6 +161,30 @@ function persistInbox() {
     await fs.rename(temporaryFile, inboxFile)
   })
   return inboxWrite
+}
+
+let leadWrite = Promise.resolve()
+function persistLeads() {
+  const snapshot = { ownerUserId: leadsOwnerId, leads: [...leads.values()] }
+  leadWrite = leadWrite.catch(() => {}).then(async () => {
+    await fs.mkdir(path.dirname(leadsFile), { recursive: true })
+    const temporaryFile = `${leadsFile}.tmp`
+    await fs.writeFile(temporaryFile, JSON.stringify(snapshot), { mode: 0o600 })
+    await fs.rename(temporaryFile, leadsFile)
+  })
+  return leadWrite
+}
+
+let appointmentWrite = Promise.resolve()
+function persistAppointments() {
+  const snapshot = { ownerUserId: appointmentsOwnerId, appointments: [...appointments.values()] }
+  appointmentWrite = appointmentWrite.catch(() => {}).then(async () => {
+    await fs.mkdir(path.dirname(appointmentsFile), { recursive: true })
+    const temporaryFile = `${appointmentsFile}.tmp`
+    await fs.writeFile(temporaryFile, JSON.stringify(snapshot), { mode: 0o600 })
+    await fs.rename(temporaryFile, appointmentsFile)
+  })
+  return appointmentWrite
 }
 
 async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = Date.now(), id }) {
@@ -142,6 +207,74 @@ function inboxSummary(chat) {
   return { jid: chat.jid, name: chat.name || chat.jid.split('@')[0], unread: Number(chat.unread || 0), updatedAt: chat.updatedAt, lastMessage: lastMessage?.text || '' }
 }
 
+async function upsertLeadFromMessage({ jid, name, text, timestamp = Date.now(), messageId }) {
+  if (!jid || !text) return
+  if (!leadsOwnerId) leadsOwnerId = ownerUserId
+  const id = jid
+  const current = leads.get(id) || {
+    id, jid, phone: jid.split('@')[0], name: '', status: 'new',
+    createdAt: timestamp, messageCount: 0, firstMessage: String(text).slice(0, 1000)
+  }
+  if (messageId && current.lastMessageId === messageId) return
+  if (name) current.name = String(name).slice(0, 100)
+  current.lastMessage = String(text).slice(0, 1000)
+  if (messageId) current.lastMessageId = String(messageId).slice(0, 160)
+  current.updatedAt = timestamp
+  current.messageCount = Number(current.messageCount || 0) + 1
+  leads.set(id, current)
+  await persistLeads()
+}
+
+async function backfillLeadsFromInbox() {
+  let changed = false
+  for (const chat of inboxChats.values()) {
+    if (leads.has(chat.jid)) continue
+    const inbound = chat.messages.filter(message => !message.fromMe && message.text)
+    const last = inbound.at(-1)
+    if (!last) continue
+    leads.set(chat.jid, {
+      id: chat.jid, jid: chat.jid, phone: chat.jid.split('@')[0], name: chat.name || '',
+      status: 'new', createdAt: inbound[0].timestamp || chat.updatedAt,
+      updatedAt: last.timestamp || chat.updatedAt, messageCount: inbound.length, lastMessageId: last.id,
+      firstMessage: inbound[0].text, lastMessage: last.text
+    })
+    changed = true
+  }
+  if (changed) await persistLeads()
+}
+
+function safeLeadUpdate(lead, input = {}) {
+  const fields = ['name', 'status', 'projectType', 'area', 'budget', 'style', 'scope', 'notes']
+  for (const field of fields) {
+    if (typeof input[field] === 'string') lead[field] = input[field].trim().slice(0, field === 'notes' ? 2000 : 300)
+  }
+  if (['new', 'contacted', 'qualified', 'survey_scheduled', 'won', 'lost'].includes(input.status)) lead.status = input.status
+  lead.updatedAt = Date.now()
+}
+
+const appointmentStatuses = new Set(['scheduled', 'confirmed', 'completed', 'cancelled'])
+function cleanAppointment(input, previous = {}) {
+  const customerName = typeof input.customerName === 'string' ? input.customerName.trim().slice(0, 120) : previous.customerName || ''
+  const phone = typeof input.phone === 'string' ? input.phone.trim().slice(0, 40) : previous.phone || ''
+  const location = typeof input.location === 'string' ? input.location.trim().slice(0, 500) : previous.location || ''
+  const scheduledAt = typeof input.scheduledAt === 'string' ? input.scheduledAt : previous.scheduledAt || ''
+  const parsedTime = Date.parse(scheduledAt)
+  if (!customerName) throw new Error('Nama calon pelanggan wajib diisi.')
+  if (!phone && !input.leadId && !previous.leadId) throw new Error('Pilih lead atau isi nomor WhatsApp.')
+  if (!location) throw new Error('Alamat survei wajib diisi.')
+  if (!Number.isFinite(parsedTime)) throw new Error('Tanggal dan waktu survei tidak valid.')
+  const status = appointmentStatuses.has(input.status) ? input.status : previous.status || 'scheduled'
+  return {
+    ...previous,
+    leadId: typeof input.leadId === 'string' ? input.leadId.slice(0, 160) : previous.leadId || '',
+    customerName, phone, location,
+    scheduledAt: new Date(parsedTime).toISOString(),
+    assignedTo: typeof input.assignedTo === 'string' ? input.assignedTo.trim().slice(0, 120) : previous.assignedTo || '',
+    notes: typeof input.notes === 'string' ? input.notes.trim().slice(0, 1000) : previous.notes || '',
+    status, updatedAt: Date.now()
+  }
+}
+
 app.get('/api/knowledge/documents', authenticatedUser, async (req, res) => {
   if (!requireKnowledgeOwner(req, res)) return
   res.json({ documents: knowledgeDocuments })
@@ -150,6 +283,68 @@ app.get('/api/knowledge/documents', authenticatedUser, async (req, res) => {
 app.get('/api/inbox', authenticatedUser, (req, res) => {
   if (!requireInboxOwner(req, res)) return
   res.json({ chats: [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)).map(inboxSummary) })
+})
+
+app.get('/api/leads', authenticatedUser, (req, res) => {
+  if (!requireLeadOwner(req, res)) return
+  backfillLeadsFromInbox().then(() => res.json({ leads: [...leads.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)) })).catch(error => {
+    console.error('Lead backfill failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(500).json({ error: 'Data lead gagal dimuat dari inbox.' })
+  })
+})
+
+app.put('/api/leads/:id', authenticatedUser, async (req, res) => {
+  if (!requireLeadOwner(req, res)) return
+  const lead = leads.get(String(req.params.id || ''))
+  if (!lead) return res.status(404).json({ error: 'Lead tidak ditemukan.' })
+  safeLeadUpdate(lead, req.body || {})
+  await persistLeads()
+  res.json({ lead })
+})
+
+app.get('/api/appointments', authenticatedUser, (req, res) => {
+  if (!requireAppointmentOwner(req, res)) return
+  res.json({ appointments: [...appointments.values()].sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt)) })
+})
+
+app.post('/api/appointments', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireAppointmentOwner(req, res)) return
+  try {
+    const input = req.body || {}
+    const leadId = typeof input.leadId === 'string' ? input.leadId : ''
+    const linkedLead = leadId ? leads.get(leadId) : null
+    if (leadId && !linkedLead) return res.status(404).json({ error: 'Lead yang dipilih tidak ditemukan. Muat ulang daftar lead.' })
+    const appointment = cleanAppointment({
+      ...input,
+      customerName: input.customerName || linkedLead?.name,
+      phone: input.phone || linkedLead?.phone
+    })
+    appointment.id = randomUUID()
+    appointment.createdAt = Date.now()
+    appointments.set(appointment.id, appointment)
+    if (linkedLead) {
+      linkedLead.status = 'survey_scheduled'
+      linkedLead.updatedAt = Date.now()
+      await persistLeads()
+    }
+    await persistAppointments()
+    res.status(201).json({ appointment })
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Data jadwal tidak valid.' })
+  }
+})
+
+app.put('/api/appointments/:id', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireAppointmentOwner(req, res)) return
+  const appointment = appointments.get(String(req.params.id || ''))
+  if (!appointment) return res.status(404).json({ error: 'Jadwal survei tidak ditemukan.' })
+  try {
+    Object.assign(appointment, cleanAppointment(req.body || {}, appointment))
+    await persistAppointments()
+    res.json({ appointment })
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Data jadwal tidak valid.' })
+  }
 })
 
 app.get('/api/inbox/messages', authenticatedUser, (req, res) => {
@@ -490,6 +685,7 @@ async function handleIncomingMessage(message) {
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
   inboxOwnerId = ownerUserId
   await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id })
+  await upsertLeadFromMessage({ jid, name: message.pushName, text, timestamp, messageId: message.key.id })
   if (/^(stop|berhenti|jangan hubungi|unsubscribe)$/i.test(text.trim())) {
     optedOutJids.add(jid)
     await fs.writeFile(path.join(sessionDir, 'opt-outs.json'), JSON.stringify([...optedOutJids]), { mode: 0o600 })
