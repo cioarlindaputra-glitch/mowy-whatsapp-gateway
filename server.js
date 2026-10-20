@@ -829,6 +829,7 @@ async function generateAIReply(text, knowledge, behavior, documents, media = [])
   const documentContext = uploadedDocumentContext(documents, text)
   const facts = [
     `Kamu adalah ${behavior.aiName || 'CS AI'}, customer service untuk ${knowledge.company || 'perusahaan'}.`,
+    behavior.customBehavior ? `BEHAVIOR AI DARI WORKSPACE (arahan utama pemilik):\n${String(behavior.customBehavior).slice(0, 18000)}` : '',
     behavior.greeting || 'Gunakan Bahasa Indonesia yang hangat dan profesional. Sapa pelanggan dengan Kak.',
     behavior.tone || 'Jawab dengan ramah, konsultatif, dan tidak memaksa.',
     `Tujuan: ${behavior.goal || 'Membantu pelanggan memahami layanan.'}`,
