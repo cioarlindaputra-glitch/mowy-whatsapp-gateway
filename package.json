@@ -1,0 +1,15 @@
+{
+  "name": "mowy-whatsapp-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.58.0",
+    "@whiskeysockets/baileys": "6.7.24",
+    "express": "^5.1.0",
+    "qrcode": "^1.5.4"
+  }
+}
