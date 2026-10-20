@@ -726,4 +726,14 @@ app.post('/api/ai/test', authenticatedUser, async (req, res) => {
   }
 })
 
-app.listen(port, () => console.log(`Mowy WhatsApp gateway listening on ${port}`))
+app.listen(port, () => {
+  console.log(`Mowy WhatsApp gateway listening on ${port}`)
+  if (ownerUserId) {
+    startSocket().catch(error => {
+      connectionState = 'error'
+      lastError = 'Pemulihan sesi WhatsApp saat backend mulai gagal.'
+      starting = false
+      console.error('WhatsApp startup restore failed:', error instanceof Error ? error.message : 'unknown')
+    })
+  }
+})
