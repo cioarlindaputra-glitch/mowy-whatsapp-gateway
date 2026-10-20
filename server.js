@@ -18,7 +18,7 @@ if (missing.length) throw new Error(`Missing required environment variables: ${m
 const app = express()
 const port = Number(process.env.PORT || 3000)
 const appOrigin = (process.env.APP_ORIGIN || '').replace(/\/$/, '')
-const allowedOrigins = new Set([appOrigin, ...(process.env.APP_ORIGINS || '').split(','), 'https://app.leadmarket.id'].map(origin => origin.trim().replace(/\/$/, '')).filter(Boolean))
+const allowedOrigins = new Set([appOrigin, ...(process.env.APP_ORIGINS || '').split(',')].map(origin => origin.trim().replace(/\/$/, '')).filter(Boolean))
 const baseSessionDir = path.resolve(process.env.WA_SESSION_DIR || './data/whatsapp-session')
 const baseDataDir = path.dirname(baseSessionDir)
 const workspaceRoot = path.join(baseDataDir, 'mowy-workspaces')
