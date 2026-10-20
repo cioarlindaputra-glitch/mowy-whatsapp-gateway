@@ -19,6 +19,7 @@ const knowledgeFile = path.join(path.dirname(sessionDir), 'mowy-knowledge-docume
 const inboxFile = path.join(path.dirname(sessionDir), 'mowy-inbox.json')
 const leadsFile = path.join(path.dirname(sessionDir), 'mowy-leads.json')
 const appointmentsFile = path.join(path.dirname(sessionDir), 'mowy-appointments.json')
+const leadLayoutsDir = path.join(path.dirname(sessionDir), 'mowy-lead-layouts')
 const authClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } })
 const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
@@ -29,7 +30,7 @@ app.use((req, res, next) => {
   if (origin && (!appOrigin || origin !== appOrigin)) return res.status(403).json({ error: 'Origin tidak diizinkan.' })
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Vary', 'Origin')
-  res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type')
+  res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-file-type, x-file-name')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
@@ -244,9 +245,22 @@ async function backfillLeadsFromInbox() {
 }
 
 function safeLeadUpdate(lead, input = {}) {
-  const fields = ['name', 'status', 'projectType', 'area', 'budget', 'style', 'scope', 'notes']
+  const fields = ['name', 'customerName', 'phone', 'address', 'rooms', 'estimatedSize', 'projectType', 'area', 'budget', 'style', 'scope', 'commitmentFee', 'notes']
   for (const field of fields) {
-    if (typeof input[field] === 'string') lead[field] = input[field].trim().slice(0, field === 'notes' ? 2000 : 300)
+    if (typeof input[field] === 'string') lead[field] = input[field].trim().slice(0, field === 'notes' ? 2000 : field === 'address' ? 500 : 300)
+  }
+  if (input.profileAnswers && typeof input.profileAnswers === 'object' && !Array.isArray(input.profileAnswers)) {
+    const answers = {}
+    for (let index = 1; index <= 13; index++) {
+      const value = input.profileAnswers[`c${index}`]
+      if (typeof value === 'string') answers[`c${index}`] = value.trim().slice(0, 1000)
+    }
+    lead.profileAnswers = answers
+  }
+  if (input.profileScores && typeof input.profileScores === 'object' && !Array.isArray(input.profileScores)) {
+    const scores = {}
+    for (let index = 1; index <= 13; index++) scores[`c${index}`] = input.profileScores[`c${index}`] === true
+    lead.profileScores = scores
   }
   if (['new', 'contacted', 'qualified', 'survey_scheduled', 'won', 'lost'].includes(input.status)) lead.status = input.status
   lead.updatedAt = Date.now()
@@ -300,6 +314,52 @@ app.put('/api/leads/:id', authenticatedUser, async (req, res) => {
   safeLeadUpdate(lead, req.body || {})
   await persistLeads()
   res.json({ lead })
+})
+
+const layoutTypes = new Map([['image/jpeg', '.jpg'], ['image/png', '.png'], ['image/webp', '.webp'], ['application/pdf', '.pdf']])
+const maxLeadLayoutBytes = 10 * 1024 * 1024
+app.post('/api/leads/:id/layout', authenticatedUser, express.raw({ type: 'application/octet-stream', limit: maxLeadLayoutBytes }), async (req, res) => {
+  if (!requireLeadOwner(req, res)) return
+  const lead = leads.get(String(req.params.id || ''))
+  if (!lead) return res.status(404).json({ error: 'Lead tidak ditemukan.' })
+  const mimeType = String(req.headers['x-file-type'] || '').toLowerCase()
+  const extension = layoutTypes.get(mimeType)
+  if (!extension) return res.status(415).json({ error: 'Layout harus berupa PDF, JPG, PNG, atau WEBP.' })
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'File layout kosong.' })
+  const originalName = decodeURIComponent(String(req.headers['x-file-name'] || 'layout').replace(/\+/g, ' ')).slice(0, 180)
+  const attachment = { id: randomUUID(), name: path.basename(originalName) || `layout${extension}`, mimeType, size: req.body.length, storageName: `${randomUUID()}${extension}`, uploadedAt: Date.now() }
+  try {
+    await fs.mkdir(leadLayoutsDir, { recursive: true })
+    await fs.writeFile(path.join(leadLayoutsDir, attachment.storageName), req.body, { mode: 0o600, flag: 'wx' })
+    lead.layouts = Array.isArray(lead.layouts) ? lead.layouts : []
+    lead.layouts.push(attachment)
+    lead.updatedAt = Date.now()
+    await persistLeads()
+    return res.status(201).json({ attachment, lead })
+  } catch (error) {
+    console.error('Lead layout upload failed:', error instanceof Error ? error.message : 'unknown')
+    return res.status(500).json({ error: 'Layout gagal disimpan. Periksa volume penyimpanan backend.' })
+  }
+})
+
+app.get('/api/leads/:id/layout/:fileId', authenticatedUser, async (req, res) => {
+  if (!requireLeadOwner(req, res)) return
+  const lead = leads.get(String(req.params.id || ''))
+  if (!lead) return res.status(404).json({ error: 'Lead tidak ditemukan.' })
+  const attachment = (Array.isArray(lead.layouts) ? lead.layouts : []).find(file => file.id === req.params.fileId)
+  if (!attachment || !layoutTypes.has(attachment.mimeType) || !/^[a-f0-9-]+\.(jpg|png|webp|pdf)$/i.test(attachment.storageName || '')) return res.status(404).json({ error: 'Lampiran layout tidak ditemukan.' })
+  try {
+    const file = await fs.readFile(path.join(leadLayoutsDir, attachment.storageName))
+    res.setHeader('Content-Type', attachment.mimeType)
+    res.setHeader('Content-Length', file.length)
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(attachment.name)}`)
+    res.setHeader('Cache-Control', 'private, no-store')
+    return res.send(file)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return res.status(404).json({ error: 'File layout tidak ditemukan di penyimpanan backend.' })
+    console.error('Lead layout download failed:', error instanceof Error ? error.message : 'unknown')
+    return res.status(500).json({ error: 'Layout gagal dibuka.' })
+  }
 })
 
 app.get('/api/appointments', authenticatedUser, (req, res) => {
