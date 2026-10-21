@@ -68,7 +68,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin
   const allowed = !origin || allowedOrigins.has(origin)
   if (req.path === '/api/moey/connection' || req.path === '/api/whatsapp/status') {
-    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, status: res.statusCode })))
+    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, privateNetwork: req.headers['access-control-request-private-network'] || null, status: res.statusCode })))
   }
   if (origin && !allowed) {
     console.warn(JSON.stringify({ event: 'cors_rejected', method: req.method, path: req.path, origin }))
@@ -84,7 +84,13 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-file-type, x-file-name, x-media-name, x-media-category')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-  if (req.method === 'OPTIONS') return res.sendStatus(204)
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Cache-Control', 'no-store')
+    if (origin && allowed && req.headers['access-control-request-private-network'] === 'true') {
+      res.setHeader('Access-Control-Allow-Private-Network', 'true')
+    }
+    return res.sendStatus(204)
+  }
   next()
 })
 app.use(express.json({ limit: '512kb' }))
