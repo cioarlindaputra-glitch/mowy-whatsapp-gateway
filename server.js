@@ -95,6 +95,30 @@ app.use((req, res, next) => {
   next()
 })
 app.use(express.json({ limit: '512kb' }))
+app.use(express.urlencoded({ extended: false, limit: '512kb' }))
+
+// Browser-safe bridge: form POSTs are CORS-simple requests and avoid a failing OPTIONS preflight.
+app.use('/api/moey/bridge', (req, res, next) => {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Metode bridge tidak diizinkan.' })
+  const { method, path: targetPath, token, payload } = req.body || {}
+  const allowedMethods = new Set(['GET', 'POST', 'PUT', 'DELETE'])
+  if (typeof method !== 'string' || !allowedMethods.has(method.toUpperCase())) return res.status(400).json({ error: 'Metode permintaan tidak valid.' })
+  if (typeof token !== 'string' || !token.trim()) return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' })
+  if (typeof targetPath !== 'string') return res.status(400).json({ error: 'Alamat API tidak valid.' })
+  let target
+  try { target = new URL(targetPath, 'https://gateway.invalid') } catch { return res.status(400).json({ error: 'Alamat API tidak valid.' }) }
+  if (target.origin !== 'https://gateway.invalid' || !target.pathname.startsWith('/api/') || target.pathname === '/api/moey/bridge') return res.status(400).json({ error: 'Alamat API tidak diizinkan.' })
+  req.method = method.toUpperCase()
+  req.url = target.pathname + target.search
+  req.headers.authorization = `Bearer ${token.trim()}`
+  if (req.method === 'GET' || req.method === 'DELETE') req.body = {}
+  else {
+    try { req.body = payload ? JSON.parse(payload) : {} } catch { return res.status(400).json({ error: 'Isi permintaan tidak valid.' }) }
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ error: 'Isi permintaan tidak valid.' })
+  }
+  res.setHeader('Cache-Control', 'no-store')
+  next()
+})
 
 // Keep the original API routes intact while giving the dashboard a unique
 // path that is less likely to be mistaken for an advertising/tracking endpoint.
