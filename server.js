@@ -76,6 +76,14 @@ app.use((req, res, next) => {
 })
 app.use(express.json({ limit: '512kb' }))
 
+// Route the dashboard's uniquely named prospects endpoint to the existing lead handlers.
+app.use((req, res, next) => {
+  if (req.url === '/api/moey/prospects' || req.url.startsWith('/api/moey/prospects/')) {
+    req.url = req.url.replace(/^\\/api\\/moey\\/prospects(?=\\/|$)/, '/api/leads')
+  }
+  next()
+})
+
 let legacyWorkspace = null
 if (legacyOwnerUserId) legacyWorkspace = await loadWorkspace(legacyOwnerUserId)
 
