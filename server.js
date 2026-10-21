@@ -76,10 +76,11 @@ app.use((req, res, next) => {
 })
 app.use(express.json({ limit: '512kb' }))
 
-// Route the dashboard's uniquely named prospects endpoint to the existing lead handlers.
+// Keep the original API routes intact while giving the dashboard a unique
+// path that is less likely to be mistaken for an advertising/tracking endpoint.
 app.use((req, res, next) => {
   if (req.url === '/api/moey/prospects' || req.url.startsWith('/api/moey/prospects/')) {
-    req.url = req.url.replace(/^\\/api\\/moey\\/prospects(?=\\/|$)/, '/api/leads')
+    req.url = req.url.replace(/^\/api\/moey\/prospects(?=\/|$)/, '/api/leads')
   }
   next()
 })
