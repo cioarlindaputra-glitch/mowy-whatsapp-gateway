@@ -66,7 +66,14 @@ const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_
 app.disable('x-powered-by')
 app.use((req, res, next) => {
   const origin = req.headers.origin
-  if (origin && !allowedOrigins.has(origin)) return res.status(403).json({ error: 'Origin tidak diizinkan.' })
+  const allowed = !origin || allowedOrigins.has(origin)
+  if (req.path === '/api/moey/connection' || req.path === '/api/whatsapp/status') {
+    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, status: res.statusCode })))
+  }
+  if (origin && !allowed) {
+    console.warn(JSON.stringify({ event: 'cors_rejected', method: req.method, path: req.path, origin }))
+    return res.status(403).json({ error: 'Origin tidak diizinkan.' })
+  }
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Vary', 'Origin')
   res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-file-type, x-file-name, x-media-name, x-media-category')
