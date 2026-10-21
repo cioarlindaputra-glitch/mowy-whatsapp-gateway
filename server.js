@@ -69,13 +69,21 @@ app.use((req, res, next) => {
   const origin = req.headers.origin
   const allowed = !origin || allowedOrigins.has(origin)
   if (req.path === '/api/moey/connection' || req.path === '/api/whatsapp/status') {
-    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, privateNetwork: req.headers['access-control-request-private-network'] || null, status: res.statusCode })))
+    const startedAt = Date.now()
+    const logPath = req.path
+    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: logPath, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, privateNetwork: req.headers['access-control-request-private-network'] || null, status: res.statusCode, durationMs: Date.now() - startedAt })))
+    res.on('close', () => { if (!res.writableFinished) console.warn(JSON.stringify({ event: 'cors_request_aborted', method: req.method, path: logPath, origin: origin || null, durationMs: Date.now() - startedAt })) })
   }
   if (origin && !allowed) {
     console.warn(JSON.stringify({ event: 'cors_rejected', method: req.method, path: req.path, origin }))
     return res.status(403).json({ error: 'Origin tidak diizinkan.' })
   }
-  if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    // Dashboard fetches may use credentials: 'include'; browsers reject those
+    // responses unless this is set. Auth itself still uses the Bearer token.
+    res.setHeader('Access-Control-Allow-Credentials', 'true')
+  }
   res.setHeader('Vary', 'Origin')
   const requestedHeaders = req.headers['access-control-request-headers']
   const requestedHeaderList = String(requestedHeaders || '').split(',').map(header => header.trim().toLowerCase()).filter(Boolean)
