@@ -111,7 +111,9 @@ app.use((req, res, next) => {
 let legacyWorkspace = null
 if (legacyOwnerUserId) legacyWorkspace = await loadWorkspace(legacyOwnerUserId)
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, portfolioMediaReplies: true }))
+const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, portfolioMediaReplies: true }
+app.get('/', (_req, res) => res.json(healthStatus))
+app.get('/health', (_req, res) => res.json(healthStatus))
 
 async function authenticatedUser(req, res, next) {
   try {
