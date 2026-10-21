@@ -144,8 +144,16 @@ app.use((req, res, next) => {
   const query = queryIndex === -1 ? '' : req.url.slice(queryIndex)
   let pathname = (queryIndex === -1 ? req.url : req.url.slice(0, queryIndex)).replace(/\/{2,}/g, '/')
   if (pathname.length > 1) pathname = pathname.replace(/\/$/, '')
-  if (pathname === '/api/moey/connection') pathname = moeyConnectionRoutes[req.method] || '/api/whatsapp/status'
-  else if (pathAliases[pathname]) pathname = pathAliases[pathname]
+  const channelMatch = pathname.match(/^\/api\/moey\/(connection|bridge|channel|link|session|gateway)(?:\/(status|qr|start|connect|link|stop|disconnect|logout|unlink))?$/)
+  if (channelMatch) {
+    const action = channelMatch[2]
+    if (action === 'status' || action === 'qr') pathname = '/api/whatsapp/status'
+    else if (action === 'start' || action === 'connect' || action === 'link') pathname = '/api/whatsapp/connect'
+    else if (action) pathname = '/api/whatsapp/disconnect'
+    else pathname = moeyConnectionRoutes[req.method] || '/api/whatsapp/status'
+    // Connect/disconnect handlers are POST routes; accept DELETE/PUT from the dashboard too.
+    if (pathname !== '/api/whatsapp/status' && req.method !== 'OPTIONS') req.method = 'POST'
+  } else if (pathAliases[pathname]) pathname = pathAliases[pathname]
   else if (/^\/api\/moey\/prospects(?=\/|$)/.test(pathname)) pathname = pathname.replace(/^\/api\/moey\/prospects/, '/api/leads')
   else if (pathname.startsWith('/api/moey/')) pathname = pathname.replace(/^\/api\/moey\//, '/api/')
   req.url = pathname + query
