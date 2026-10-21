@@ -58,6 +58,7 @@ const chatQueues = proxyForMap('chatQueues')
 const optedOutJids = new Proxy(new Set(), { get(_target, property) { const set = workspaceStorage.getStore()?.optedOutJids; if (!set) throw new Error('Workspace context unavailable for opted-out contacts'); const value = set[property]; return typeof value === 'function' ? value.bind(set) : value } })
 const inboxChats = proxyForMap('inboxChats')
 const leads = proxyForMap('leads')
+
 const appointments = proxyForMap('appointments')
 const businessMedia = proxyForMap('businessMedia')
 const authClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } })
@@ -118,6 +119,7 @@ async function authenticatedUser(req, res, next) {
     if (!token) return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' })
     const { data, error } = await authClient.auth.getUser(token)
     if (error || !data.user) return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' })
+
     req.mowyUser = data.user
     req.mowyWorkspace = await loadWorkspace(data.user.id)
     workspaceStorage.run(req.mowyWorkspace, next)
@@ -178,6 +180,7 @@ function requireAppointmentOwner(req, res) {
 function persistInbox() {
   const workspace = currentWorkspace(), file = workspace.files.inbox
   const snapshot = { ownerUserId: workspace.userId, chats: [...inboxChats.values()] }
+
   workspace.writes.inbox = workspace.writes.inbox.catch(() => {}).then(async () => {
     await fs.mkdir(path.dirname(file), { recursive: true })
     const temporaryFile = `${file}.tmp`
@@ -238,6 +241,7 @@ async function upsertLeadFromMessage({ jid, name, text, timestamp = Date.now(), 
     id, jid, phone: jid.split('@')[0], name: '', status: 'new',
     createdAt: timestamp, messageCount: 0, firstMessage: String(text).slice(0, 1000)
   }
+
   if (messageId && current.lastMessageId === messageId) return
   if (name) current.name = String(name).slice(0, 100)
   current.lastMessage = String(text).slice(0, 1000)
@@ -298,6 +302,7 @@ function persistMedia() {
     await fs.rename(temporaryFile, file)
   })
   return workspace.writes.media
+
 }
 
 const mediaTypes = new Map([
@@ -358,6 +363,7 @@ app.put('/api/media/:id', authenticatedUser, async (req, res) => {
   file.updatedAt = Date.now()
   await persistMedia()
   res.json({ file })
+
 })
 
 app.delete('/api/media/:id', authenticatedUser, async (req, res) => {
@@ -418,6 +424,7 @@ app.get('/api/inbox', authenticatedUser, (req, res) => {
 app.get('/api/leads', authenticatedUser, (req, res) => {
   if (!requireLeadOwner(req, res)) return
   backfillLeadsFromInbox().then(() => res.json({ leads: [...leads.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)) })).catch(error => {
+
     console.error('Lead backfill failed:', error instanceof Error ? error.message : 'unknown')
     res.status(500).json({ error: 'Data lead gagal dimuat dari inbox.' })
   })
@@ -477,6 +484,7 @@ app.get('/api/leads/:id/layout/:fileId', authenticatedUser, async (req, res) => 
     return res.status(500).json({ error: 'Layout gagal dibuka.' })
   }
 })
+
 
 app.get('/api/appointments', authenticatedUser, (req, res) => {
   if (!requireAppointmentOwner(req, res)) return
@@ -539,6 +547,7 @@ app.post('/api/inbox/read', authenticatedUser, async (req, res) => {
   res.json({ saved: true })
 })
 
+
 app.post('/api/inbox/reply', authenticatedUser, async (req, res) => {
   if (!requireOwner(req, res) || !requireInboxOwner(req, res)) return
   const jid = String(req.body?.jid || '')
@@ -598,6 +607,7 @@ const extractableKnowledgeFields = ['company', 'website', 'areas', 'hours', 'ser
 
 function cleanExtractedText(value) {
   return typeof value === 'string' ? value.trim().slice(0, 6000) : ''
+
 }
 
 app.post('/api/knowledge/sync', authenticatedUser, async (req, res) => {
@@ -658,6 +668,7 @@ app.post('/api/knowledge/sync', authenticatedUser, async (req, res) => {
     }
     if (faqChanges) { config.knowledge.faqs = faqs; updatedFields.push(`knowledge.faqs (${faqChanges})`) }
     const metadata = { ...(data.user.user_metadata || {}), mowy_config: config }
+
     if (config.knowledge.company) metadata.business_name = config.knowledge.company
     const { data: updated, error: updateError } = await adminClient.auth.admin.updateUserById(req.mowyUser.id, { user_metadata: metadata })
     if (updateError) throw updateError
@@ -718,6 +729,7 @@ async function startSocket(workspace = currentWorkspace()) {
   workspace.socket.ev.on('connection.update', (update) => workspaceStorage.run(workspace, async () => {
     if (update.qr) {
       workspace.qrDataUrl = await QRCode.toDataURL(update.qr, { width: 280, margin: 2 })
+
       workspace.connectionState = 'qr'
     }
     if (update.connection === 'open') {
@@ -778,6 +790,7 @@ function extractText(message) {
 }
 
 function uploadedDocumentContext(documents, question) {
+
   if (!Array.isArray(documents)) return ''
   const stop = new Set(['yang', 'dan', 'atau', 'untuk', 'dengan', 'dari', 'pada', 'apa', 'bagaimana', 'berapa', 'saya', 'kami', 'kamu', 'bisa', 'ada', 'ini', 'itu', 'the', 'and', 'for'])
   const terms = [...new Set((question.toLowerCase().match(/[a-z0-9\u00c0-\u024f]{3,}/g) || []).filter((word) => !stop.has(word)))]
@@ -838,6 +851,7 @@ async function generateAIReply(text, knowledge, behavior, documents, media = [],
     behavior.customBehavior ? `BEHAVIOR AI DARI WORKSPACE (arahan utama pemilik):\n${String(behavior.customBehavior).slice(0, 18000)}` : '',
     behavior.greeting || 'Gunakan Bahasa Indonesia yang hangat dan profesional. Sapa pelanggan dengan Kak.',
     behavior.tone || 'Jawab dengan ramah, konsultatif, dan tidak memaksa.',
+
     `Tujuan: ${behavior.goal || 'Membantu pelanggan memahami layanan.'}`,
     `Profiling: ${behavior.profiling || 'Gali kebutuhan bertahap, satu pertanyaan utama per balasan.'}`,
     `Aturan harga: ${behavior.pricingRules || 'Jangan mengarang harga, promo, atau klaim.'}`,
@@ -898,6 +912,7 @@ async function sendBusinessMedia(socket, jid, file) {
   let payload
   if (['image/jpeg', 'image/png', 'image/webp'].includes(file.mimeType)) payload = { image: { url: file.path }, caption, mimetype: file.mimeType }
   else if (['video/mp4', 'video/webm'].includes(file.mimeType)) payload = { video: { url: file.path }, caption, mimetype: file.mimeType }
+
   else if (['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'].includes(file.mimeType)) payload = { document: { url: file.path }, fileName: file.name, mimetype: file.mimeType, caption }
   else return false
   const sent = await socket.sendMessage(jid, payload)
@@ -958,6 +973,7 @@ app.post('/api/ai/test', authenticatedUser, async (req, res) => {
     res.status(502).json({ error: 'Uji AI gagal. Periksa kunci OpenAI dan log gateway.' })
   }
 })
+
 
 app.listen(port, () => {
   console.log(`Mowy WhatsApp gateway listening on ${port}`)
