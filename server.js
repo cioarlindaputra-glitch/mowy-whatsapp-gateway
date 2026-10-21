@@ -68,7 +68,7 @@ app.disable('x-powered-by')
 app.use((req, res, next) => {
   const origin = req.headers.origin
   const allowed = !origin || allowedOrigins.has(origin)
-  if (req.path === '/api/moey/connection' || req.path === '/api/whatsapp/status') {
+  if (/^\/+(api\/+(moey|whatsapp)|health)/.test(req.path)) {
     const startedAt = Date.now()
     const logPath = req.path
     res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: logPath, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, privateNetwork: req.headers['access-control-request-private-network'] || null, status: res.statusCode, durationMs: Date.now() - startedAt })))
@@ -106,13 +106,25 @@ app.use(express.json({ limit: '512kb' }))
 
 // Keep the original API routes intact while giving the dashboard a unique
 // path that is less likely to be mistaken for an advertising/tracking endpoint.
+// Matching ignores the query string (dashboards often add cache-busting
+// parameters), repeated slashes, and a trailing slash.
+const moeyConnectionRoutes = { GET: '/api/whatsapp/status', POST: '/api/whatsapp/connect', DELETE: '/api/whatsapp/disconnect' }
+const pathAliases = {
+  '/api/health': '/health', '/api/moey/health': '/health', '/healthz': '/health', '/api/status': '/health',
+  '/api/moey/status': '/api/whatsapp/status', '/api/moey/qr': '/api/whatsapp/status', '/api/whatsapp/qr': '/api/whatsapp/status',
+  '/api/moey/connect': '/api/whatsapp/connect', '/api/moey/connection/start': '/api/whatsapp/connect',
+  '/api/moey/disconnect': '/api/whatsapp/disconnect', '/api/moey/connection/stop': '/api/whatsapp/disconnect',
+}
 app.use((req, res, next) => {
-  if (req.url === '/api/moey/connection') {
-    req.url = '/api/whatsapp/status'
-  }
-  if (req.url === '/api/moey/prospects' || req.url.startsWith('/api/moey/prospects/')) {
-    req.url = req.url.replace(/^\/api\/moey\/prospects(?=\/|$)/, '/api/leads')
-  }
+  const queryIndex = req.url.indexOf('?')
+  const query = queryIndex === -1 ? '' : req.url.slice(queryIndex)
+  let pathname = (queryIndex === -1 ? req.url : req.url.slice(0, queryIndex)).replace(/\/{2,}/g, '/')
+  if (pathname.length > 1) pathname = pathname.replace(/\/$/, '')
+  if (pathname === '/api/moey/connection') pathname = moeyConnectionRoutes[req.method] || '/api/whatsapp/status'
+  else if (pathAliases[pathname]) pathname = pathAliases[pathname]
+  else if (/^\/api\/moey\/prospects(?=\/|$)/.test(pathname)) pathname = pathname.replace(/^\/api\/moey\/prospects/, '/api/leads')
+  else if (pathname.startsWith('/api/moey/')) pathname = pathname.replace(/^\/api\/moey\//, '/api/')
+  req.url = pathname + query
   next()
 })
 
@@ -984,6 +996,10 @@ app.post('/api/ai/test', authenticatedUser, async (req, res) => {
   }
 })
 
+app.use((req, res) => {
+  console.warn(JSON.stringify({ event: 'route_not_found', method: req.method, path: req.originalUrl.split('?')[0], rewrittenPath: req.path, origin: req.headers.origin || null }))
+  res.status(404).json({ error: `Route ${req.method} ${req.originalUrl.split('?')[0]} tidak ada di gateway WhatsApp.` })
+})
 
 app.listen(port, () => {
   console.log(`Mowy WhatsApp gateway listening on ${port}`)
