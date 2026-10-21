@@ -68,7 +68,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin
   const allowed = !origin || allowedOrigins.has(origin)
   if (req.path === '/api/moey/connection' || req.path === '/api/whatsapp/status') {
-    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, status: res.statusCode })))
+    res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: req.path, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, status: res.statusCode })))
   }
   if (origin && !allowed) {
     console.warn(JSON.stringify({ event: 'cors_rejected', method: req.method, path: req.path, origin }))
@@ -76,7 +76,13 @@ app.use((req, res, next) => {
   }
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Vary', 'Origin')
-  res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-file-type, x-file-name, x-media-name, x-media-category')
+  const requestedHeaders = req.headers['access-control-request-headers']
+  const requestedHeaderList = String(requestedHeaders || '').split(',').map(header => header.trim().toLowerCase()).filter(Boolean)
+  if (origin && allowed && requestedHeaderList.length && requestedHeaderList.every(header => /^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(header))) {
+    res.setHeader('Access-Control-Allow-Headers', requestedHeaderList.join(', '))
+  } else {
+    res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-file-type, x-file-name, x-media-name, x-media-category')
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
