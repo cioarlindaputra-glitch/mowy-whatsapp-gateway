@@ -90,7 +90,7 @@ app.use((req, res, next) => {
     if (origin && allowed && req.headers['access-control-request-private-network'] === 'true') {
       res.setHeader('Access-Control-Allow-Private-Network', 'true')
     }
-    return res.sendStatus(204)
+    return res.status(200).end()
   }
   next()
 })
