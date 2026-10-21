@@ -106,7 +106,11 @@ app.use(express.json({ limit: '512kb' }))
 app.use(express.urlencoded({ extended: false, limit: '512kb' }))
 
 // Browser-safe bridge: form POSTs are CORS-simple requests and avoid a failing OPTIONS preflight.
-app.use('/api/moey/bridge', (req, res, next) => {
+// Mounted without a path prefix: with app.use('/api/moey/bridge', ...) Express
+// re-prepends the mount path after next(), turning the rewritten URL into
+// /api/moey/bridge/api/... and every bridged call into a 404.
+app.use((req, res, next) => {
+  if (req.path.replace(/\/+$/, '') !== '/api/moey/bridge') return next()
   if (req.method !== 'POST') return res.status(405).json({ error: 'Metode bridge tidak diizinkan.' })
   const { method, path: targetPath, token, payload } = req.body || {}
   const allowedMethods = new Set(['GET', 'POST', 'PUT', 'DELETE'])
@@ -144,7 +148,7 @@ app.use((req, res, next) => {
   const query = queryIndex === -1 ? '' : req.url.slice(queryIndex)
   let pathname = (queryIndex === -1 ? req.url : req.url.slice(0, queryIndex)).replace(/\/{2,}/g, '/')
   if (pathname.length > 1) pathname = pathname.replace(/\/$/, '')
-  const channelMatch = pathname.match(/^\/api\/moey\/(connection|bridge|channel|link|session|gateway)(?:\/(status|qr|start|connect|link|stop|disconnect|logout|unlink))?$/)
+  const channelMatch = pathname.match(/^\/api\/moey\/(connection|channel|link|session|gateway)(?:\/(status|qr|start|connect|link|stop|disconnect|logout|unlink))?$/)
   if (channelMatch) {
     const action = channelMatch[2]
     if (action === 'status' || action === 'qr') pathname = '/api/whatsapp/status'
@@ -1030,7 +1034,7 @@ app.post('/api/ai/test', authenticatedUser, async (req, res) => {
 
 app.use((req, res) => {
   console.warn(JSON.stringify({ event: 'route_not_found', method: req.method, path: req.originalUrl.split('?')[0], rewrittenPath: req.path, origin: req.headers.origin || null }))
-  res.status(404).json({ error: `Route ${req.method} ${req.originalUrl.split('?')[0]} tidak ada di gateway WhatsApp.` })
+  res.status(404).json({ error: `Route ${req.method} ${req.path} tidak ada di gateway WhatsApp.` })
 })
 
 app.listen(port, () => {
