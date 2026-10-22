@@ -355,6 +355,13 @@ function safeLeadUpdate(lead, input = {}) {
     lead.manualProfileKeys = Object.keys(scores).filter(key => scores[key] !== Boolean(aiScores[key]))
   }
   if (['new', 'contacted', 'qualified', 'survey_scheduled', 'won', 'lost'].includes(input.status)) lead.status = input.status
+  // Toggle balasan AI per lead. aiReply=false berarti percakapan di-handover ke tim:
+  // pesan tetap dicatat di inbox/lead, tetapi AI tidak membalas.
+  if (typeof input.aiReply === 'boolean') {
+    lead.aiReply = input.aiReply
+    lead.handoverAt = input.aiReply ? null : Date.now()
+    if (typeof input.handoverTo === 'string') lead.handoverTo = input.handoverTo.trim().slice(0, 120)
+  }
   applyLeadScore(lead)
   lead.updatedAt = Date.now()
 }
@@ -618,7 +625,7 @@ app.get('/api/inbox', authenticatedUser, (req, res) => {
 app.get('/api/leads', authenticatedUser, (req, res) => {
   if (!requireLeadOwner(req, res)) return
   backfillLeadsFromInbox().then(() => {
-    const list = [...leads.values()].map(lead => (lead.scoreRows ? lead : applyLeadScore(lead))).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+    const list = [...leads.values()].map(lead => { if (typeof lead.aiReply !== 'boolean') lead.aiReply = true; return lead.scoreRows ? lead : applyLeadScore(lead) }).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
     res.json({ leads: list, scoring: { enabled: leadScoringEnabled, variables: leadScoringVariables.map(({ key, label, weight, media }) => ({ key, label, weight, media })), stages: { hot: 70, warm: 40 } } })
   }).catch(error => {
     console.error('Lead backfill failed:', error instanceof Error ? error.message : 'unknown')
@@ -658,6 +665,17 @@ app.post('/api/leads/score-all', authenticatedUser, async (req, res) => {
     try { await scoreLead(lead.id); scored++ } catch (error) { failed++; console.error('Lead bulk scoring failed:', lead.id, error instanceof Error ? error.message : 'unknown') }
   }
   res.json({ scored, failed, remaining: Math.max(0, [...leads.values()].filter(lead => !lead.scoredAt && inboxChats.has(lead.jid)).length) })
+})
+
+// Toggle balasan AI per lead: { "enabled": true|false, "handoverTo": "nama tim (opsional)" }
+app.post('/api/leads/:id/ai-reply', authenticatedUser, async (req, res) => {
+  if (!requireLeadOwner(req, res)) return
+  const lead = leads.get(String(req.params.id || ''))
+  if (!lead) return res.status(404).json({ error: 'Lead tidak ditemukan.' })
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: 'Kirim { "enabled": true | false }.' })
+  safeLeadUpdate(lead, { aiReply: req.body.enabled, handoverTo: req.body.handoverTo })
+  await persistLeads()
+  res.json({ lead, aiReply: lead.aiReply })
 })
 
 app.put('/api/leads/:id', authenticatedUser, async (req, res) => {
@@ -1191,6 +1209,7 @@ async function handleIncomingMessage(message) {
   const knowledge = config.knowledge || {}
   const behavior = config.behavior || {}
   if (behavior.autoReply !== true) { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'auto_reply_off' })); return }
+  if (leads.get(jid)?.aiReply === false) { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'lead_handover' })); return }
   const history = recentConversationHistory(jid, message.key.id)
   const answer = await generateAIReply(text, knowledge, behavior, workspace.knowledgeDocuments, config.media, history)
   if (!answer) { console.warn(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'empty_ai_answer' })); return }
