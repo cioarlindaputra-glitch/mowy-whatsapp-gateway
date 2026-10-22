@@ -1,6 +1,6 @@
 import express from 'express'
 import QRCode from 'qrcode'
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys'
+import makeWASocket, { Browsers, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys'
 import { createClient } from '@supabase/supabase-js'
 import { Boom } from '@hapi/boom'
 import fs from 'node:fs/promises'
@@ -954,7 +954,16 @@ async function startSocket(workspace = currentWorkspace()) {
   workspace.connectionState = 'connecting'
   await fs.mkdir(workspace.files.sessionDir, { recursive: true })
   const { state, saveCreds } = await useMultiFileAuthState(workspace.files.sessionDir)
-  workspace.socket = makeWASocket({ auth: state, printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false })
+  // Versi WA Web yang di-hardcode Baileys cepat kedaluwarsa; server WhatsApp lalu mengabaikan
+  // query awal (fetchProps) sampai timeout dan pesan masuk tidak pernah sampai. Ambil versi terbaru
+  // tiap kali sesi dimulai, pakai identitas browser yang jelas, dan longgarkan timeout.
+  let version
+  try { ({ version } = await fetchLatestBaileysVersion()) } catch (error) { console.warn('Fetching latest WA Web version failed, using bundled version:', error instanceof Error ? error.message : 'unknown') }
+  workspace.socket = makeWASocket({
+    auth: state, version, browser: Browsers.ubuntu('Chrome'),
+    printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false,
+    connectTimeoutMs: 90_000, defaultQueryTimeoutMs: 120_000, keepAliveIntervalMs: 20_000, retryRequestDelayMs: 500,
+  })
   workspace.socket.ev.on('creds.update', saveCreds)
   workspace.socket.ev.on('connection.update', (update) => workspaceStorage.run(workspace, async () => {
     if (update.qr) {
@@ -1153,8 +1162,11 @@ async function sendBusinessMedia(socket, jid, file) {
 async function handleIncomingMessage(message) {
   const text = extractText(message)
   const workspace = currentWorkspace()
-  if (!text || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') return
   const jid = message.key.remoteJid
+  if (!text || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') {
+    console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: !text ? 'no_text' : workspace.connectionState !== 'connected' ? `state_${workspace.connectionState}` : 'no_socket' }))
+    return
+  }
   const rawTimestamp = message.messageTimestamp?.toNumber?.() ?? Number(message.messageTimestamp || Math.floor(Date.now() / 1000))
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
   await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id })
@@ -1178,10 +1190,11 @@ async function handleIncomingMessage(message) {
   const config = data.user.user_metadata?.mowy_config || {}
   const knowledge = config.knowledge || {}
   const behavior = config.behavior || {}
-  if (behavior.autoReply !== true) return
+  if (behavior.autoReply !== true) { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'auto_reply_off' })); return }
   const history = recentConversationHistory(jid, message.key.id)
   const answer = await generateAIReply(text, knowledge, behavior, workspace.knowledgeDocuments, config.media, history)
-  if (!answer) return
+  if (!answer) { console.warn(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'empty_ai_answer' })); return }
+  console.info(JSON.stringify({ event: 'auto_reply_sent', jid, characters: answer.length }))
   const sent = await workspace.socket.sendMessage(message.key.remoteJid, { text: answer })
   await saveInboxMessage({ jid, name: message.pushName, text: answer, fromMe: true, timestamp: Date.now(), id: sent?.key?.id })
   for (const file of selectRequestedBusinessMedia(text, config.media)) {
