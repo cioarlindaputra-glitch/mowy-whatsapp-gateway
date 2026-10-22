@@ -961,7 +961,7 @@ async function startSocket(workspace = currentWorkspace()) {
   try { ({ version } = await fetchLatestBaileysVersion()) } catch (error) { console.warn('Fetching latest WA Web version failed, using bundled version:', error instanceof Error ? error.message : 'unknown') }
   workspace.socket = makeWASocket({
     auth: state, version, browser: Browsers.ubuntu('Chrome'),
-    printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false,
+    markOnlineOnConnect: false, syncFullHistory: false,
     connectTimeoutMs: 90_000, defaultQueryTimeoutMs: 120_000, keepAliveIntervalMs: 20_000, retryRequestDelayMs: 500,
   })
   workspace.socket.ev.on('creds.update', saveCreds)
