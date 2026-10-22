@@ -20,6 +20,7 @@ const port = Number(process.env.PORT || 3000)
 const appOrigin = (process.env.APP_ORIGIN || '').replace(/\/$/, '')
 const dashboardOrigin = 'https://mowy-cs-ai.jellyjelley17.chatgpt.site'
 const allowedOrigins = new Set([dashboardOrigin, appOrigin, ...(process.env.APP_ORIGINS || '').split(',')].map(origin => origin.trim().replace(/\/$/, '')).filter(Boolean))
+const leadScoringEnabled = String(process.env.LEAD_SCORING_ENABLED || 'true').toLowerCase() !== 'false'
 const baseSessionDir = path.resolve(process.env.WA_SESSION_DIR || './data/whatsapp-session')
 const baseDataDir = path.dirname(baseSessionDir)
 const workspaceRoot = path.join(baseDataDir, 'mowy-workspaces')
@@ -359,7 +360,6 @@ function safeLeadUpdate(lead, input = {}) {
 // Hasil disimpan ke lead.profileAnswers (c1..c13), lead.profileScores (c1..c13),
 // lead.score, lead.stage, lead.nextQuestion, lead.scoredAt.
 // ---------------------------------------------------------------------------
-const leadScoringEnabled = String(process.env.LEAD_SCORING_ENABLED || 'true').toLowerCase() !== 'false'
 const leadScoringVariables = [
   { key: 'c1',  label: 'Identitas customer (status)', weight: 2.00, media: 'Chat', rule: 'true jika nama/identitas customer sudah diketahui (mis. "Bu Ana").' },
   { key: 'c2',  label: 'Alamat Project', weight: 2.00, media: 'Chat', rule: 'true jika lokasi/alamat project sudah disebut (kota, perumahan, atau alamat).' },
