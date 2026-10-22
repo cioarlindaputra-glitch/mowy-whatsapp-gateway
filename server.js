@@ -167,7 +167,7 @@ app.use((req, res, next) => {
 let legacyWorkspace = null
 if (legacyOwnerUserId) legacyWorkspace = await loadWorkspace(legacyOwnerUserId)
 
-const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, portfolioMediaReplies: true }
+const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, portfolioMediaReplies: true, leadScoring: leadScoringEnabled }
 app.get('/', (_req, res) => res.json(healthStatus))
 app.get('/health', (_req, res) => res.json(healthStatus))
 
