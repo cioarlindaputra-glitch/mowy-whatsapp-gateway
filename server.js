@@ -69,7 +69,7 @@ app.disable('x-powered-by')
 app.use((req, res, next) => {
   const origin = req.headers.origin
   const allowed = !origin || allowedOrigins.has(origin)
-  if (/^\/+(api\/+(moey|whatsapp)|health)/.test(req.path)) {
+  if (/^\/+(api\/|health)/.test(req.path)) {
     const startedAt = Date.now()
     const logPath = req.path
     res.on('finish', () => console.info(JSON.stringify({ event: 'cors_request', method: req.method, path: logPath, origin: origin || null, allowed, requestedMethod: req.headers['access-control-request-method'] || null, requestedHeaders: req.headers['access-control-request-headers'] || null, privateNetwork: req.headers['access-control-request-private-network'] || null, status: res.statusCode, durationMs: Date.now() - startedAt })))
