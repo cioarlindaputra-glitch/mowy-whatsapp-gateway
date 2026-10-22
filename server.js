@@ -277,7 +277,8 @@ async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = D
   if (!jid || !text) return
   const chat = inboxChats.get(jid) || { jid, name: '', unread: 0, updatedAt: timestamp, messages: [] }
   if (id && chat.messages.some(message => message.id === String(id))) return
-  if (name) chat.name = String(name).slice(0, 100)
+  // Nama kontak hanya diambil dari pesan customer; pushName pesan keluar adalah nama akun bisnis sendiri.
+  if (name && !fromMe) chat.name = String(name).slice(0, 100)
   chat.updatedAt = timestamp
   if (!fromMe) chat.unread = Math.min(999, Number(chat.unread || 0) + 1)
   chat.messages.push({ id: String(id || `${timestamp}-${chat.messages.length}`).slice(0, 120), text: String(text).slice(0, 2000), fromMe: Boolean(fromMe), timestamp })
@@ -315,14 +316,17 @@ async function backfillLeadsFromInbox() {
   let changed = false
   for (const chat of inboxChats.values()) {
     if (leads.has(chat.jid)) continue
+    // Setiap percakapan di inbox adalah kontak prospek, walaupun pesan customer belum tercatat
+    // (mis. chat dimulai dari nomor bisnis atau pesan masuk sebelum gateway tersambung).
     const inbound = chat.messages.filter(message => !message.fromMe && message.text)
-    const last = inbound.at(-1)
+    const source = inbound.length ? inbound : chat.messages.filter(message => message.text)
+    const last = source.at(-1)
     if (!last) continue
     leads.set(chat.jid, {
       id: chat.jid, jid: chat.jid, phone: chat.jid.split('@')[0], name: chat.name || '',
-      status: 'new', createdAt: inbound[0].timestamp || chat.updatedAt,
+      status: 'new', createdAt: source[0].timestamp || chat.updatedAt,
       updatedAt: last.timestamp || chat.updatedAt, messageCount: inbound.length, lastMessageId: last.id,
-      firstMessage: inbound[0].text, lastMessage: last.text
+      firstMessage: source[0].text, lastMessage: last.text
     })
     changed = true
   }
