@@ -103,8 +103,35 @@ app.use((req, res, next) => {
   }
   next()
 })
-app.use(express.json({ limit: '512kb' }))
-app.use(express.urlencoded({ extended: false, limit: '512kb' }))
+// Upload file (media bisnis & layout lead) dibaca sebagai stream mentah di handler-nya sendiri.
+// Kalau parser JSON ikut membaca body upload, ia menolak di 512 KB sebelum body habis dibaca,
+// koneksi diputus di tengah, dan browser hanya menampilkan "Failed to fetch".
+const isRawUploadPath = (req) => /^\/+api\/+(moey\/+)?(media\/+upload|leads\/+[^/]+\/+layout)\/*$/.test(req.path)
+app.use(express.json({ limit: '512kb', type: (req) => !isRawUploadPath(req) && /json/i.test(req.headers['content-type'] || '') }))
+app.use(express.urlencoded({ extended: false, limit: '512kb', type: (req) => !isRawUploadPath(req) && /urlencoded/i.test(req.headers['content-type'] || '') }))
+
+// Habiskan sisa body sebelum membalas error pada request upload. Tanpa ini, respons error dikirim
+// saat browser masih mengunggah, koneksi di-reset, dan error aslinya tidak pernah terlihat.
+async function drainRequest(req) {
+  if (req.readableEnded || req.complete) return
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 8000)
+    const done = () => { clearTimeout(timer); resolve() }
+    req.on('end', done); req.on('close', done); req.on('error', done)
+    req.resume()
+  })
+}
+
+async function readRawBody(req, limit) {
+  const chunks = []
+  let received = 0
+  for await (const chunk of req) {
+    received += chunk.length
+    if (received > limit) throw Object.assign(new Error('Ukuran file melebihi batas.'), { statusCode: 413 })
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
 
 // Browser-safe bridge: form POSTs are CORS-simple requests and avoid a failing OPTIONS preflight.
 // Mounted without a path prefix: with app.use('/api/moey/bridge', ...) Express
@@ -175,9 +202,9 @@ app.get('/health', (_req, res) => res.json(healthStatus))
 async function authenticatedUser(req, res, next) {
   try {
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
-    if (!token) return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' })
+    if (!token) { if (isRawUploadPath(req)) await drainRequest(req); return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' }) }
     const { data, error } = await authClient.auth.getUser(token)
-    if (error || !data.user) return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' })
+    if (error || !data.user) { if (isRawUploadPath(req)) await drainRequest(req); return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' }) }
 
     req.mowyUser = data.user
     req.mowyWorkspace = await loadWorkspace(data.user.id)
@@ -518,16 +545,69 @@ function safeHeader(req, name, max = 180) {
   try { return decodeURIComponent(value).trim().slice(0, max) } catch { return value.trim().slice(0, max) }
 }
 
+// Parser multipart/form-data sederhana (satu file + field teks) tanpa dependensi tambahan.
+function parseMultipart(buffer, contentType) {
+  const boundaryMatch = /boundary=("?)([^";]+)\1/i.exec(contentType || '')
+  if (!boundaryMatch) return null
+  const boundary = Buffer.from(`--${boundaryMatch[2]}`)
+  const fields = {}
+  let file = null
+  let position = buffer.indexOf(boundary)
+  while (position !== -1) {
+    const partStart = position + boundary.length
+    if (buffer.slice(partStart, partStart + 2).toString() === '--') break
+    const headerEnd = buffer.indexOf('\r\n\r\n', partStart)
+    if (headerEnd === -1) break
+    const next = buffer.indexOf(boundary, headerEnd)
+    if (next === -1) break
+    const headers = buffer.slice(partStart, headerEnd).toString('utf8')
+    const body = buffer.slice(headerEnd + 4, next - 2)
+    const nameMatch = /name="([^"]*)"/i.exec(headers)
+    const filenameMatch = /filename="([^"]*)"/i.exec(headers)
+    const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(headers)
+    if (filenameMatch) { if (!file) file = { fieldName: nameMatch?.[1] || 'file', filename: filenameMatch[1], mimeType: (typeMatch?.[1] || '').trim().toLowerCase(), data: body } }
+    else if (nameMatch) fields[nameMatch[1]] = body.toString('utf8')
+    position = next
+  }
+  return { fields, file }
+}
+
 app.post('/api/media/upload', authenticatedUser, async (req, res) => {
-  if (!requireMediaOwner(req, res)) return
-  const mimeType = String(req.headers['x-file-type'] || '').toLowerCase()
-  const extension = mediaTypes.get(mimeType)
-  if (!extension) return res.status(415).json({ error: 'Format file belum didukung. Gunakan PDF, gambar, video MP4/WEBM, DOCX, atau XLSX.' })
+  const contentType = String(req.headers['content-type'] || '').toLowerCase()
   const contentLength = Number(req.headers['content-length'] || 0)
-  if (contentLength > maxMediaBytes) return res.status(413).json({ error: 'Ukuran file maksimal 200 MB.' })
-  const category = safeHeader(req, 'x-media-category', 40)
-  const name = safeHeader(req, 'x-media-name', 180)
-  if (!mediaCategories.has(category) || !name) return res.status(400).json({ error: 'Isi kategori dan nama file terlebih dahulu.' })
+  console.info(JSON.stringify({ event: 'media_upload_received', contentType: contentType.split(';')[0], contentLength, fileType: req.headers['x-file-type'] || null, category: req.headers['x-media-category'] || null, hasName: Boolean(req.headers['x-media-name']) }))
+  const reject = async (status, error) => { await drainRequest(req); return res.status(status).json({ error }) }
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) return reject(403, 'Workspace tidak valid.')
+  if (contentLength > maxMediaBytes) return reject(413, 'Ukuran file maksimal 200 MB.')
+  const headerMime = String(req.headers['x-file-type'] || '').toLowerCase()
+  let mimeType = headerMime, category = safeHeader(req, 'x-media-category', 40), name = safeHeader(req, 'x-media-name', 180)
+  let data = null
+  try {
+    if (/multipart\/form-data/.test(contentType)) {
+      const parsed = parseMultipart(await readRawBody(req, maxMediaBytes), contentType)
+      if (!parsed?.file) return reject(400, 'File tidak ditemukan dalam unggahan.')
+      data = parsed.file.data
+      mimeType = mimeType || parsed.file.mimeType
+      category = category || String(parsed.fields.category || '').trim().slice(0, 40)
+      name = name || String(parsed.fields.name || parsed.file.filename || '').trim().slice(0, 180)
+    } else if (/application\/json/.test(contentType)) {
+      let body
+      try { body = JSON.parse((await readRawBody(req, 96 * 1024 * 1024)).toString('utf8')) } catch { return reject(400, 'Isi unggahan tidak valid.') }
+      const base64 = String(body?.data || body?.content || body?.base64 || '').replace(/^data:[^;]+;base64,/, '')
+      if (!base64) return reject(400, 'File tidak ditemukan dalam unggahan.')
+      data = Buffer.from(base64, 'base64')
+      mimeType = mimeType || String(body.mimeType || body.type || body.fileType || '').toLowerCase()
+      category = category || String(body.category || '').trim().slice(0, 40)
+      name = name || String(body.name || body.fileName || '').trim().slice(0, 180)
+    }
+  } catch (error) {
+    if (error?.statusCode === 413) return reject(413, 'Ukuran file maksimal 200 MB.')
+    console.error('Business media upload parse failed:', error instanceof Error ? error.message : 'unknown')
+    return reject(400, 'Unggahan tidak dapat dibaca.')
+  }
+  const extension = mediaTypes.get(mimeType)
+  if (!extension) return reject(415, `Format file belum didukung (${mimeType || 'tipe tidak dikirim'}). Gunakan PDF, gambar, video MP4/WEBM, DOCX, atau XLSX.`)
+  if (!mediaCategories.has(category) || !name) return reject(400, `Isi kategori dan nama file terlebih dahulu. (kategori diterima: ${category || '-'})`)
   const id = randomUUID()
   const storageName = `${id}${extension}`
   const target = path.join(currentWorkspace().files.mediaDir, storageName)
@@ -539,16 +619,24 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
   } })
   try {
     await fs.mkdir(currentWorkspace().files.mediaDir, { recursive: true })
-    await pipeline(req, sizeLimit, createWriteStream(target, { flags: 'wx', mode: 0o600 }))
+    if (data) {
+      if (!data.length) return reject(400, 'File unggahan kosong.')
+      if (data.length > maxMediaBytes) return reject(413, 'Ukuran file maksimal 200 MB.')
+      await fs.writeFile(target, data, { mode: 0o600, flag: 'wx' })
+      received = data.length
+    } else {
+      await pipeline(req, sizeLimit, createWriteStream(target, { flags: 'wx', mode: 0o600 }))
+    }
     const file = { id, name, category, mimeType, size: received, storageName, uploadedAt: Date.now() }
     businessMedia.set(id, file)
     await persistMedia()
+    console.info(JSON.stringify({ event: 'media_upload_saved', id, size: received, mimeType, category }))
     return res.status(201).json({ file })
   } catch (error) {
     await fs.rm(target, { force: true }).catch(() => {})
-    if (error?.statusCode === 413) return res.status(413).json({ error: 'Ukuran file maksimal 200 MB.' })
+    if (error?.statusCode === 413) return reject(413, 'Ukuran file maksimal 200 MB.')
     console.error('Business media upload failed:', error instanceof Error ? error.message : 'unknown')
-    return res.status(500).json({ error: 'File gagal disimpan. Pastikan Render memiliki disk persisten yang cukup.' })
+    return reject(500, `File gagal disimpan di server (${error?.code || 'unknown'}). Periksa disk persisten dan izin folder data.`)
   }
 })
 
