@@ -107,8 +107,22 @@ app.use((req, res, next) => {
 // Kalau parser JSON ikut membaca body upload, ia menolak di 512 KB sebelum body habis dibaca,
 // koneksi diputus di tengah, dan browser hanya menampilkan "Failed to fetch".
 const isRawUploadPath = (req) => /^\/+api\/+(moey\/+)?(media\/+upload|leads\/+[^/]+\/+layout)\/*$/.test(req.path)
-app.use(express.json({ limit: '512kb', type: (req) => !isRawUploadPath(req) && /json/i.test(req.headers['content-type'] || '') }))
-app.use(express.urlencoded({ extended: false, limit: '512kb', type: (req) => !isRawUploadPath(req) && /urlencoded/i.test(req.headers['content-type'] || '') }))
+// Dashboard mengirim semua request lewat /api/moey/bridge (form POST), termasuk upload file
+// berupa base64 di dalam payload. Batas body untuk jalur bridge harus cukup untuk file 64 MB.
+const isBridgePath = (req) => /^\/+api\/+moey\/+bridge\/*$/.test(req.path)
+const bridgeBodyLimit = '128mb'
+app.use(express.json({ limit: bridgeBodyLimit, type: (req) => isBridgePath(req) && /json/i.test(req.headers['content-type'] || '') }))
+app.use(express.urlencoded({ extended: false, limit: bridgeBodyLimit, parameterLimit: 50, type: (req) => isBridgePath(req) && /urlencoded/i.test(req.headers['content-type'] || '') }))
+app.use(express.json({ limit: '512kb', type: (req) => !isBridgePath(req) && !isRawUploadPath(req) && /json/i.test(req.headers['content-type'] || '') }))
+app.use(express.urlencoded({ extended: false, limit: '512kb', type: (req) => !isBridgePath(req) && !isRawUploadPath(req) && /urlencoded/i.test(req.headers['content-type'] || '') }))
+// Body yang ditolak parser (terlalu besar / tidak valid) dijawab JSON setelah body dikuras,
+// supaya browser menerima pesan errornya dan bukan "Failed to fetch".
+app.use((error, req, res, next) => {
+  if (!error) return next()
+  const tooLarge = error.type === 'entity.too.large' || error.status === 413
+  console.warn(JSON.stringify({ event: 'body_rejected', path: req.path, type: error.type || null, status: error.status || null, contentLength: req.headers['content-length'] || null }))
+  drainRequest(req).finally(() => res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? 'Ukuran file terlalu besar untuk diunggah. Maksimal 64 MB.' : 'Isi permintaan tidak dapat dibaca.' }))
+})
 
 // Habiskan sisa body sebelum membalas error pada request upload. Tanpa ini, respons error dikirim
 // saat browser masih mengunggah, koneksi di-reset, dan error aslinya tidak pernah terlihat.
@@ -155,6 +169,7 @@ app.use((req, res, next) => {
   else {
     try { req.body = payload ? JSON.parse(payload) : {} } catch { return res.status(400).json({ error: 'Isi permintaan tidak valid.' }) }
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ error: 'Isi permintaan tidak valid.' })
+    console.info(JSON.stringify({ event: 'bridge_request', method: req.method, path: target.pathname, payloadBytes: typeof payload === 'string' ? payload.length : 0, keys: Object.keys(req.body).slice(0, 12) }))
   }
   res.setHeader('Cache-Control', 'no-store')
   next()
@@ -590,6 +605,15 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
       mimeType = mimeType || parsed.file.mimeType
       category = category || String(parsed.fields.category || '').trim().slice(0, 40)
       name = name || String(parsed.fields.name || parsed.file.filename || '').trim().slice(0, 180)
+    } else if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) && Object.keys(req.body).length) {
+      // Datang lewat /api/moey/bridge: payload sudah diparse menjadi objek.
+      const body = req.body
+      const base64 = String(body.data || body.content || body.base64 || body.file || '').replace(/^data:[^;]+;base64,/, '')
+      if (!base64) return reject(400, 'File tidak ditemukan dalam unggahan.')
+      data = Buffer.from(base64, 'base64')
+      mimeType = mimeType || String(body.mimeType || body.type || body.fileType || '').toLowerCase()
+      category = category || String(body.category || '').trim().slice(0, 40)
+      name = name || String(body.name || body.fileName || '').trim().slice(0, 180)
     } else if (/application\/json/.test(contentType)) {
       let body
       try { body = JSON.parse((await readRawBody(req, 96 * 1024 * 1024)).toString('utf8')) } catch { return reject(400, 'Isi unggahan tidak valid.') }
@@ -604,6 +628,13 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
     if (error?.statusCode === 413) return reject(413, 'Ukuran file maksimal 200 MB.')
     console.error('Business media upload parse failed:', error instanceof Error ? error.message : 'unknown')
     return reject(400, 'Unggahan tidak dapat dibaca.')
+  }
+  if (!mediaTypes.has(mimeType)) {
+    // Tebak dari ekstensi nama file bila dashboard tidak mengirim tipe MIME.
+    const byExtension = { '.pdf': 'application/pdf', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    const guessSource = String(req.body?.fileName || req.body?.filename || req.body?.originalName || name || '').toLowerCase()
+    const guessed = byExtension[path.extname(guessSource)]
+    if (guessed) mimeType = guessed
   }
   const extension = mediaTypes.get(mimeType)
   if (!extension) return reject(415, `Format file belum didukung (${mimeType || 'tipe tidak dikirim'}). Gunakan PDF, gambar, video MP4/WEBM, DOCX, atau XLSX.`)
