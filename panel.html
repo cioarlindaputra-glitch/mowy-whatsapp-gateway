@@ -125,14 +125,26 @@
   const $ = (id) => document.getElementById(id)
   let token = null, leads = [], timer = null
 
+  // Token sesi Supabase bisa sangat besar (membawa konfigurasi AI), melebihi batas header HTTP.
+  // Karena itu semua panggilan lewat /api/moey/bridge: token dikirim di body, bukan header.
   async function api(path, options = {}) {
-    const headers = Object.assign({ Authorization: 'Bearer ' + token }, options.headers || {})
-    if (options.json !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(options.json) }
-    const res = await fetch(path, Object.assign({}, options, { headers }))
+    const method = (options.method || 'GET').toUpperCase()
+    const form = new URLSearchParams({ method, path, token })
+    if (options.json !== undefined) form.set('payload', JSON.stringify(options.json))
+    const res = await fetch('/api/moey/bridge', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() })
     let data = null
     try { data = await res.json() } catch {}
     if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status))
     return data
+  }
+  async function apiBlob(path) {
+    const form = new URLSearchParams({ method: 'GET', path, token })
+    const res = await fetch('/api/moey/bridge', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    return res.blob()
+  }
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1] || ''); r.onerror = () => reject(new Error('File tidak dapat dibaca.')); r.readAsDataURL(file) })
   }
 
   function show(tab) {
@@ -229,7 +241,7 @@
   }
   $('mediaRows').addEventListener('click', async (e) => {
     const d = e.target.dataset || {}
-    if (d.open) { e.preventDefault(); try { const res = await fetch('/api/media/' + d.open, { headers: { Authorization: 'Bearer ' + token } }); const blob = await res.blob(); window.open(URL.createObjectURL(blob), '_blank') } catch {} }
+    if (d.open) { e.preventDefault(); try { const blob = await apiBlob('/api/media/' + d.open); window.open(URL.createObjectURL(blob), '_blank') } catch (err) { $('mediaErr').textContent = err.message } }
     if (d.del && confirm('Hapus file ini?')) { try { await api('/api/media/' + d.del, { method: 'DELETE' }); loadMedia() } catch (err) { $('mediaErr').textContent = err.message } }
   })
   $('uploadForm').addEventListener('submit', async (e) => {
@@ -240,7 +252,8 @@
     try {
       const byExt = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', mp4: 'video/mp4', webm: 'video/webm', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
       const mime = file.type || byExt[(file.name.split('.').pop() || '').toLowerCase()] || ''
-      const r = await api('/api/media/upload', { method: 'POST', body: file, headers: { 'Content-Type': mime || 'application/octet-stream', 'x-file-type': mime, 'x-media-name': encodeURIComponent($('mName').value.trim()), 'x-media-category': encodeURIComponent($('mCategory').value), 'x-register-media': '1' } })
+      const data = await fileToBase64(file)
+      const r = await api('/api/media/upload', { method: 'POST', json: { name: $('mName').value.trim(), category: $('mCategory').value, fileName: file.name, mimeType: mime, data, register: true } })
       $('uploadOk').textContent = `"${r.file.name}" tersimpan dan terdaftar untuk AI.`
       $('uploadForm').reset(); loadMedia()
     } catch (err) { $('uploadErr').textContent = err.message }
