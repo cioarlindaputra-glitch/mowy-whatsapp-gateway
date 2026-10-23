@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel Mowy</title>
+<style>
+  :root { --bg:#f5f6fb; --card:#fff; --text:#1b1d2a; --muted:#6b7084; --line:#e6e8f0; --accent:#4f5bff; --hot:#d93025; --warm:#e08a00; --cold:#6b7084; --ok:#1a8f4b; }
+  * { box-sizing:border-box }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text) }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 20px; display:flex; align-items:center; gap:16px; flex-wrap:wrap }
+  header h1 { font-size:18px; margin:0 }
+  header .spacer { flex:1 }
+  header button, .tabs button { background:#fff; border:1px solid var(--line); border-radius:8px; padding:7px 12px; cursor:pointer; font:inherit }
+  .tabs button.active { background:var(--accent); color:#fff; border-color:var(--accent) }
+  main { max-width:1200px; margin:0 auto; padding:20px }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:18px }
+  .muted { color:var(--muted); font-size:13px }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)) }
+  .stat b { font-size:26px; display:block }
+  table { width:100%; border-collapse:collapse; font-size:14px }
+  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; color:#fff }
+  .hot { background:var(--hot) } .warm { background:var(--warm) } .cold { background:var(--cold) }
+  .handover { background:#fff3e0; color:#9a5b00; border:1px solid #f1c27a }
+  .switch { position:relative; width:44px; height:24px; display:inline-block }
+  .switch input { opacity:0; width:0; height:0 }
+  .switch span { position:absolute; inset:0; background:#c9ccd8; border-radius:999px; cursor:pointer; transition:.2s }
+  .switch span:before { content:""; position:absolute; width:18px; height:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s }
+  .switch input:checked + span { background:var(--ok) }
+  .switch input:checked + span:before { transform:translateX(20px) }
+  .switch input:disabled + span { opacity:.5; cursor:wait }
+  .btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; font:inherit }
+  .btn.secondary { background:#fff; color:var(--text); border:1px solid var(--line) }
+  .btn:disabled { opacity:.6; cursor:wait }
+  .link { color:var(--accent); cursor:pointer; background:none; border:0; padding:0; font:inherit }
+  input[type=text], input[type=email], input[type=password], select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:inherit }
+  label { display:block; font-weight:600; font-size:13px; margin:10px 0 4px }
+  .row { display:grid; gap:12px; grid-template-columns:1fr 1fr }
+  .err { color:var(--hot); font-size:13px; margin-top:8px }
+  .ok { color:var(--ok); font-size:13px; margin-top:8px }
+  .detail { background:#fafbff; border:1px solid var(--line); border-radius:8px; padding:10px; margin-top:8px; font-size:13px }
+  .detail table td, .detail table th { padding:5px 6px }
+  .score { font-weight:700 }
+  .login { max-width:420px; margin:60px auto }
+  @media (max-width:720px) { .row { grid-template-columns:1fr } th:nth-child(4), td:nth-child(4) { display:none } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Panel Mowy</h1>
+  <nav class="tabs" id="tabs" hidden>
+    <button data-tab="leads" class="active">Leads</button>
+    <button data-tab="media">File & Portofolio</button>
+  </nav>
+  <div class="spacer"></div>
+  <span class="muted" id="who"></span>
+  <button id="logout" hidden>Keluar</button>
+</header>
+<main>
+  <section id="login" class="card login">
+    <h2 style="margin-top:0">Masuk</h2>
+    <p class="muted">Gunakan email dan password akun Mowy yang sama dengan dashboard.</p>
+    <form id="loginForm">
+      <label>Email</label><input type="email" id="email" required autocomplete="username">
+      <label>Password</label><input type="password" id="password" required autocomplete="current-password">
+      <div style="margin-top:14px"><button class="btn" type="submit">Masuk</button></div>
+      <div class="err" id="loginErr"></div>
+    </form>
+  </section>
+
+  <section id="leads" hidden>
+    <div class="grid" style="margin-bottom:18px">
+      <div class="card stat"><span class="muted">Total lead</span><b id="stTotal">0</b></div>
+      <div class="card stat"><span class="muted">Hot (≥70%)</span><b id="stHot">0</b></div>
+      <div class="card stat"><span class="muted">Warm (40–69%)</span><b id="stWarm">0</b></div>
+      <div class="card stat"><span class="muted">Handover ke tim</span><b id="stHandover">0</b></div>
+    </div>
+    <div class="card">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <h2 style="margin:0;font-size:17px">Daftar lead</h2>
+        <span class="muted" id="leadsInfo"></span>
+        <div class="spacer" style="flex:1"></div>
+        <button class="btn secondary" id="refreshLeads">Perbarui</button>
+        <button class="btn" id="scoreAll">Nilai semua lead</button>
+      </div>
+      <div class="muted" style="margin-bottom:8px">Toggle <b>Balas AI</b> mati = percakapan di-handover ke tim; pesan tetap masuk inbox, AI tidak membalas.</div>
+      <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Pelanggan</th><th>Skor</th><th>Prioritas tanya berikutnya</th><th>Pesan terbaru</th><th>Balas AI</th><th></th></tr></thead>
+        <tbody id="leadRows"></tbody>
+      </table>
+      </div>
+      <div class="err" id="leadsErr"></div>
+    </div>
+  </section>
+
+  <section id="media" hidden>
+    <div class="card">
+      <h2 style="margin-top:0;font-size:17px">Unggah file portofolio / materi</h2>
+      <p class="muted">PDF, JPG, PNG, WEBP, MP4, WEBM, DOCX, XLSX · maksimal 64 MB agar bisa dikirim otomatis lewat WhatsApp. File langsung terdaftar untuk AI.</p>
+      <form id="uploadForm">
+        <div class="row">
+          <div><label>Nama file / materi</label><input type="text" id="mName" required placeholder="Portofolio Apartemen Skyhouse"></div>
+          <div><label>Kategori</label><select id="mCategory"></select></div>
+        </div>
+        <label>File</label><input type="file" id="mFile" required accept=".pdf,.jpg,.jpeg,.png,.webp,.mp4,.webm,.docx,.xlsx">
+        <div style="margin-top:14px"><button class="btn" type="submit" id="uploadBtn">Unggah & daftarkan</button></div>
+        <div class="err" id="uploadErr"></div><div class="ok" id="uploadOk"></div>
+      </form>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0;font-size:17px">File tersimpan di gateway</h2>
+      <table><thead><tr><th>Nama</th><th>Kategori</th><th>Ukuran</th><th>Terdaftar untuk AI</th><th></th></tr></thead><tbody id="mediaRows"></tbody></table>
+      <div class="err" id="mediaErr"></div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.47.10/dist/umd/supabase.min.js"></script>
+<script>
+(function () {
+  const supabase = window.supabase.createClient('__SUPABASE_URL__', '__SUPABASE_ANON_KEY__')
+  const $ = (id) => document.getElementById(id)
+  let token = null, leads = [], timer = null
+
+  async function api(path, options = {}) {
+    const headers = Object.assign({ Authorization: 'Bearer ' + token }, options.headers || {})
+    if (options.json !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(options.json) }
+    const res = await fetch(path, Object.assign({}, options, { headers }))
+    let data = null
+    try { data = await res.json() } catch {}
+    if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status))
+    return data
+  }
+
+  function show(tab) {
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab))
+    $('leads').hidden = tab !== 'leads'; $('media').hidden = tab !== 'media'
+    if (tab === 'leads') loadLeads(); else loadMedia()
+  }
+
+  async function setSession(session) {
+    token = session && session.access_token
+    const loggedIn = Boolean(token)
+    $('login').hidden = loggedIn; $('tabs').hidden = !loggedIn; $('logout').hidden = !loggedIn
+    $('who').textContent = loggedIn ? (session.user.email || '') : ''
+    clearInterval(timer)
+    if (loggedIn) { show('leads'); timer = setInterval(() => { if (!$('leads').hidden) loadLeads(true) }, 30000) }
+    else { $('leads').hidden = true; $('media').hidden = true }
+  }
+
+  $('loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault(); $('loginErr').textContent = ''
+    const { data, error } = await supabase.auth.signInWithPassword({ email: $('email').value.trim(), password: $('password').value })
+    if (error) { $('loginErr').textContent = 'Login gagal: ' + error.message; return }
+    setSession(data.session)
+  })
+  $('logout').addEventListener('click', async () => { await supabase.auth.signOut(); setSession(null) })
+  document.querySelectorAll('#tabs button').forEach(b => b.addEventListener('click', () => show(b.dataset.tab)))
+  $('refreshLeads').addEventListener('click', () => loadLeads())
+  $('scoreAll').addEventListener('click', async () => {
+    const btn = $('scoreAll'); btn.disabled = true; btn.textContent = 'Menilai…'
+    try { const r = await api('/api/leads/score-all', { method: 'POST', json: {} }); $('leadsInfo').textContent = `Dinilai ${r.scored}, gagal ${r.failed}`; await loadLeads(true) }
+    catch (err) { $('leadsErr').textContent = err.message }
+    finally { btn.disabled = false; btn.textContent = 'Nilai semua lead' }
+  })
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+  const fmtTime = (t) => t ? new Date(Number(t)).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-'
+
+  async function loadLeads(silent) {
+    if (!silent) $('leadsErr').textContent = ''
+    try {
+      const data = await api('/api/leads')
+      leads = data.leads || []
+      renderLeads()
+      $('leadsInfo').textContent = `${leads.length} lead · diperbarui ${new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}`
+    } catch (err) { $('leadsErr').textContent = err.message; if (/login|sesi/i.test(err.message)) setSession(null) }
+  }
+
+  function renderLeads() {
+    const open = new Set([...document.querySelectorAll('tr.detail-row:not([hidden])')].map(r => r.dataset.id))
+    $('stTotal').textContent = leads.length
+    $('stHot').textContent = leads.filter(l => l.stage === 'hot').length
+    $('stWarm').textContent = leads.filter(l => l.stage === 'warm').length
+    $('stHandover').textContent = leads.filter(l => l.aiReply === false).length
+    $('leadRows').innerHTML = leads.map(l => {
+      const stage = l.stage || 'cold', ai = l.aiReply !== false
+      const rows = (l.scoreRows || []).map(r => `<tr><td>${esc(r.key.slice(1))}</td><td>${esc(r.label)}</td><td>${r.weight.toFixed(2)}%</td><td>${r.fulfilled ? '✅ ' + r.hasil.toFixed(2) + '%' : '—'}</td><td>${esc(r.output)}</td></tr>`).join('')
+      return `<tr data-id="${esc(l.id)}">
+        <td><b>${esc(l.name || l.phone || l.id)}</b><div class="muted">${esc(l.phone || '')} · ${esc(l.status || 'new')}${ai ? '' : ' · <span class="badge handover">Handover' + (l.handoverTo ? ': ' + esc(l.handoverTo) : '') + '</span>'}</div></td>
+        <td><span class="badge ${stage}">${stage.toUpperCase()}</span> <span class="score">${(l.score || 0).toFixed(2)}%</span><div class="muted">${l.scoredAt ? 'dinilai ' + fmtTime(l.scoredAt) : 'belum dinilai'}</div></td>
+        <td>${esc(l.nextQuestion || '-')}</td>
+        <td class="muted">${esc((l.lastMessage || '').slice(0, 90))}<div>${fmtTime(l.updatedAt)}</div></td>
+        <td><label class="switch"><input type="checkbox" data-toggle="${esc(l.id)}" ${ai ? 'checked' : ''}><span></span></label></td>
+        <td><button class="link" data-detail="${esc(l.id)}">${open.has(l.id) ? 'Tutup' : 'Rincian'}</button> · <button class="link" data-rescore="${esc(l.id)}">Hitung ulang</button></td>
+      </tr>
+      <tr class="detail-row" data-id="${esc(l.id)}" ${open.has(l.id) ? '' : 'hidden'}><td colspan="6"><div class="detail"><table><thead><tr><th>#</th><th>Variabel</th><th>Bobot</th><th>Hasil</th><th>Output</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="muted">Belum ada penilaian. Klik "Hitung ulang".</td></tr>'}</tbody></table></div></td></tr>`
+    }).join('') || '<tr><td colspan="6" class="muted">Belum ada lead.</td></tr>'
+  }
+
+  $('leadRows').addEventListener('change', async (e) => {
+    const id = e.target.dataset.toggle; if (!id) return
+    const input = e.target; input.disabled = true
+    try { const r = await api('/api/leads/' + encodeURIComponent(id) + '/ai-reply', { method: 'POST', json: { enabled: input.checked } }); const i = leads.findIndex(l => l.id === id); if (i >= 0) leads[i] = r.lead; renderLeads() }
+    catch (err) { $('leadsErr').textContent = err.message; input.checked = !input.checked }
+    finally { input.disabled = false }
+  })
+  $('leadRows').addEventListener('click', async (e) => {
+    const d = e.target.dataset || {}
+    if (d.detail) { const row = document.querySelector(`tr.detail-row[data-id="${CSS.escape(d.detail)}"]`); row.hidden = !row.hidden; e.target.textContent = row.hidden ? 'Rincian' : 'Tutup' }
+    if (d.rescore) {
+      e.target.textContent = 'Menilai…'
+      try { const r = await api('/api/leads/' + encodeURIComponent(d.rescore) + '/score', { method: 'POST', json: {} }); const i = leads.findIndex(l => l.id === d.rescore); if (i >= 0) leads[i] = r.lead; renderLeads() }
+      catch (err) { $('leadsErr').textContent = err.message; e.target.textContent = 'Hitung ulang' }
+    }
+  })
+
+  async function loadMedia() {
+    $('mediaErr').textContent = ''
+    try {
+      const data = await api('/api/media')
+      const sel = $('mCategory'); if (!sel.options.length) data.categories.forEach(c => { const o = document.createElement('option'); o.value = o.textContent = c; sel.appendChild(o) })
+      const fmt = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB'
+      $('mediaRows').innerHTML = (data.files || []).map(f => `<tr><td><a href="/api/media/${esc(f.id)}" target="_blank" rel="noopener" data-open="${esc(f.id)}">${esc(f.name)}</a></td><td>${esc(f.category)}</td><td>${fmt(f.size)}</td><td>${f.registered ? '✅ Ya' : '—'}</td><td><button class="link" data-del="${esc(f.id)}">Hapus</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">Belum ada file.</td></tr>'
+    } catch (err) { $('mediaErr').textContent = err.message }
+  }
+  $('mediaRows').addEventListener('click', async (e) => {
+    const d = e.target.dataset || {}
+    if (d.open) { e.preventDefault(); try { const res = await fetch('/api/media/' + d.open, { headers: { Authorization: 'Bearer ' + token } }); const blob = await res.blob(); window.open(URL.createObjectURL(blob), '_blank') } catch {} }
+    if (d.del && confirm('Hapus file ini?')) { try { await api('/api/media/' + d.del, { method: 'DELETE' }); loadMedia() } catch (err) { $('mediaErr').textContent = err.message } }
+  })
+  $('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault(); $('uploadErr').textContent = ''; $('uploadOk').textContent = ''
+    const file = $('mFile').files[0]; if (!file) return
+    if (file.size > 64 * 1024 * 1024) { $('uploadErr').textContent = 'Ukuran file melebihi 64 MB.'; return }
+    const btn = $('uploadBtn'); btn.disabled = true; btn.textContent = 'Mengunggah…'
+    try {
+      const byExt = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', mp4: 'video/mp4', webm: 'video/webm', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+      const mime = file.type || byExt[(file.name.split('.').pop() || '').toLowerCase()] || ''
+      const r = await api('/api/media/upload', { method: 'POST', body: file, headers: { 'Content-Type': mime || 'application/octet-stream', 'x-file-type': mime, 'x-media-name': encodeURIComponent($('mName').value.trim()), 'x-media-category': encodeURIComponent($('mCategory').value), 'x-register-media': '1' } })
+      $('uploadOk').textContent = `"${r.file.name}" tersimpan dan terdaftar untuk AI.`
+      $('uploadForm').reset(); loadMedia()
+    } catch (err) { $('uploadErr').textContent = err.message }
+    finally { btn.disabled = false; btn.textContent = 'Unggah & daftarkan' }
+  })
+
+  supabase.auth.getSession().then(({ data }) => setSession(data.session))
+  supabase.auth.onAuthStateChange((_event, session) => { if (!session && token) setSession(null) })
+})()
+</script>
+</body>
+</html>

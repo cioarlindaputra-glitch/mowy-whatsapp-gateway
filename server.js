@@ -214,6 +214,22 @@ const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready
 app.get('/', (_req, res) => res.json(healthStatus))
 app.get('/health', (_req, res) => res.json(healthStatus))
 
+// Panel ringan bawaan gateway (satu domain, tanpa CORS): daftar lead + skor, toggle balas AI,
+// dan unggah file portofolio. Login memakai akun Supabase yang sama dengan dashboard.
+let panelHtml = null
+app.get('/panel', async (_req, res) => {
+  try {
+    if (!panelHtml) panelHtml = await fs.readFile(new URL('./panel.html', import.meta.url), 'utf8')
+    const html = panelHtml.replace('__SUPABASE_URL__', process.env.SUPABASE_URL).replace('__SUPABASE_ANON_KEY__', process.env.SUPABASE_ANON_KEY)
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
+    res.send(html)
+  } catch (error) {
+    console.error('Panel render failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(500).send('Panel tidak tersedia.')
+  }
+})
+
 async function authenticatedUser(req, res, next) {
   try {
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
@@ -662,7 +678,13 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
     businessMedia.set(id, file)
     await persistMedia()
     console.info(JSON.stringify({ event: 'media_upload_saved', id, size: received, mimeType, category }))
-    return res.status(201).json({ file })
+    // Panel gateway: daftarkan file langsung ke config.media agar AI bisa mengirimkannya ke customer.
+    const register = String(req.headers['x-register-media'] || req.body?.register || '') === '1' || req.body?.register === true
+    if (register) {
+      try { await registerMediaInConfig(req.mowyUser.id, { type: 'upload', fileId: id, name, category, mimeType, size: received }) }
+      catch (error) { console.error('Registering media in config failed:', error instanceof Error ? error.message : 'unknown') }
+    }
+    return res.status(201).json({ file, registered: register })
   } catch (error) {
     await fs.rm(target, { force: true }).catch(() => {})
     if (error?.statusCode === 413) return reject(413, 'Ukuran file maksimal 200 MB.')
@@ -693,7 +715,48 @@ app.delete('/api/media/:id', authenticatedUser, async (req, res) => {
   businessMedia.delete(file.id)
   await fs.rm(path.join(currentWorkspace().files.mediaDir, file.storageName), { force: true }).catch(() => {})
   await persistMedia()
+  unregisterMediaInConfig(req.mowyUser.id, file.id).catch(error => console.error('Unregistering media failed:', error instanceof Error ? error.message : 'unknown'))
   res.json({ deleted: true })
+})
+
+async function loadUserConfig(userId) {
+  const { data, error } = await adminClient.auth.admin.getUserById(userId)
+  if (error || !data.user) throw new Error('Workspace owner could not be loaded')
+  return { user: data.user, config: data.user.user_metadata?.mowy_config || {} }
+}
+
+async function registerMediaInConfig(userId, item) {
+  const { user, config } = await loadUserConfig(userId)
+  const media = Array.isArray(config.media) ? config.media.filter(entry => !(entry?.type === 'upload' && entry.fileId === item.fileId)) : []
+  media.push({ ...item, addedAt: new Date().toISOString() })
+  const next = { ...config, media, updatedAt: new Date().toISOString() }
+  const { error } = await adminClient.auth.admin.updateUserById(userId, { user_metadata: { ...(user.user_metadata || {}), mowy_config: next } })
+  if (error) throw error
+  return media
+}
+
+async function unregisterMediaInConfig(userId, fileId) {
+  const { user, config } = await loadUserConfig(userId)
+  const media = (Array.isArray(config.media) ? config.media : []).filter(entry => !(entry?.type === 'upload' && entry.fileId === fileId))
+  const next = { ...config, media, updatedAt: new Date().toISOString() }
+  const { error } = await adminClient.auth.admin.updateUserById(userId, { user_metadata: { ...(user.user_metadata || {}), mowy_config: next } })
+  if (error) throw error
+  return media
+}
+
+// Daftar file media + status terdaftar di config AI (dipakai panel gateway).
+app.get('/api/media', authenticatedUser, async (req, res) => {
+  if (!requireMediaOwner(req, res)) return
+  try {
+    const { config } = await loadUserConfig(req.mowyUser.id)
+    const registered = new Set((Array.isArray(config.media) ? config.media : []).filter(item => item?.type === 'upload').map(item => String(item.fileId)))
+    const links = (Array.isArray(config.media) ? config.media : []).filter(item => item?.type === 'link')
+    const files = [...businessMedia.values()].sort((a, b) => Number(b.uploadedAt) - Number(a.uploadedAt)).map(file => ({ ...file, registered: registered.has(file.id) }))
+    res.json({ files, links, categories: [...mediaCategories] })
+  } catch (error) {
+    console.error('Listing media failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(500).json({ error: 'Daftar media gagal dimuat.' })
+  }
 })
 
 app.get('/api/media/:id', authenticatedUser, (req, res) => {
