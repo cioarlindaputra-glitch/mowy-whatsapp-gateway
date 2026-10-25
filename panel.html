@@ -52,6 +52,7 @@
   <h1>Panel Mowy</h1>
   <nav class="tabs" id="tabs" hidden>
     <button data-tab="leads" class="active">Leads</button>
+    <button data-tab="survey">Jadwal Survey</button>
     <button data-tab="media">File & Portofolio</button>
   </nav>
   <div class="spacer"></div>
@@ -93,6 +94,54 @@
       </table>
       </div>
       <div class="err" id="leadsErr"></div>
+    </div>
+  </section>
+
+  <section id="survey" hidden>
+    <div class="grid" style="margin-bottom:18px">
+      <div class="card stat"><span class="muted">Hari ini</span><b id="svToday">0</b></div>
+      <div class="card stat"><span class="muted">7 hari ke depan</span><b id="svWeek">0</b></div>
+      <div class="card stat"><span class="muted">Belum ada PIC</span><b id="svNoPic">0</b></div>
+      <div class="card stat"><span class="muted">Dibuat otomatis oleh AI</span><b id="svAi">0</b></div>
+    </div>
+    <div class="card">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <h2 style="margin:0;font-size:17px">Jadwal survei</h2>
+        <span class="muted" id="svInfo"></span>
+        <div class="spacer" style="flex:1"></div>
+        <select id="svFilter" style="width:auto"><option value="upcoming">Akan datang</option><option value="all">Semua</option><option value="done">Selesai / batal</option></select>
+        <button class="btn secondary" id="refreshSurvey">Perbarui</button>
+        <button class="btn" id="addSurvey">+ Jadwal manual</button>
+      </div>
+      <div class="muted" style="margin-bottom:8px">Jadwal dibuat otomatis saat customer dan AI sepakat tanggal & jam di chat. PIC bisa diisi langsung di kolomnya (tekan Enter atau klik di luar untuk menyimpan).</div>
+      <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Tanggal & jam</th><th>Atas nama</th><th>Alamat survei</th><th>PIC</th><th>Status</th><th>Sumber</th></tr></thead>
+        <tbody id="svRows"></tbody>
+      </table>
+      </div>
+      <div class="err" id="svErr"></div>
+    </div>
+    <div class="card" id="svForm" hidden>
+      <h2 style="margin-top:0;font-size:17px">Tambah jadwal manual</h2>
+      <form id="svAddForm">
+        <div class="row">
+          <div><label>Lead</label><select id="svLead"><option value="">— tanpa lead —</option></select></div>
+          <div><label>Nama customer</label><input type="text" id="svName" placeholder="Otomatis dari lead bila dipilih"></div>
+        </div>
+        <div class="row">
+          <div><label>Nomor WhatsApp</label><input type="text" id="svPhone" placeholder="Wajib bila tanpa lead"></div>
+          <div></div>
+        </div>
+        <div class="row">
+          <div><label>Tanggal & jam</label><input type="datetime-local" id="svWhen" required style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font:inherit"></div>
+          <div><label>PIC</label><input type="text" id="svPic" placeholder="Nama petugas survei"></div>
+        </div>
+        <label>Alamat survei</label><input type="text" id="svLoc" required>
+        <label>Catatan</label><input type="text" id="svNotes">
+        <div style="margin-top:14px;display:flex;gap:8px"><button class="btn" type="submit">Simpan</button><button class="btn secondary" type="button" id="svCancelAdd">Batal</button></div>
+        <div class="err" id="svAddErr"></div>
+      </form>
     </div>
   </section>
 
@@ -149,8 +198,8 @@
 
   function show(tab) {
     document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab))
-    $('leads').hidden = tab !== 'leads'; $('media').hidden = tab !== 'media'
-    if (tab === 'leads') loadLeads(); else loadMedia()
+    $('leads').hidden = tab !== 'leads'; $('media').hidden = tab !== 'media'; $('survey').hidden = tab !== 'survey'
+    if (tab === 'leads') loadLeads(); else if (tab === 'survey') loadSurvey(); else loadMedia()
   }
 
   async function setSession(session) {
@@ -159,8 +208,8 @@
     $('login').hidden = loggedIn; $('tabs').hidden = !loggedIn; $('logout').hidden = !loggedIn
     $('who').textContent = loggedIn ? (session.user.email || '') : ''
     clearInterval(timer)
-    if (loggedIn) { show('leads'); timer = setInterval(() => { if (!$('leads').hidden) loadLeads(true) }, 30000) }
-    else { $('leads').hidden = true; $('media').hidden = true }
+    if (loggedIn) { show('leads'); timer = setInterval(() => { if (!$('leads').hidden) loadLeads(true); if (!$('survey').hidden) loadSurvey(true) }, 30000) }
+    else { $('leads').hidden = true; $('media').hidden = true; $('survey').hidden = true }
   }
 
   $('loginForm').addEventListener('submit', async (e) => {
@@ -228,6 +277,70 @@
       try { const r = await api('/api/leads/' + encodeURIComponent(d.rescore) + '/score', { method: 'POST', json: {} }); const i = leads.findIndex(l => l.id === d.rescore); if (i >= 0) leads[i] = r.lead; renderLeads() }
       catch (err) { $('leadsErr').textContent = err.message; e.target.textContent = 'Hitung ulang' }
     }
+  })
+
+  // ---------- Jadwal survei ----------
+  let surveys = []
+  const fmtWhen = (iso) => { const d = new Date(iso); return isNaN(d) ? '-' : d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', weekday: 'short', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' WIB' }
+  async function loadSurvey(silent) {
+    if (!silent) $('svErr').textContent = ''
+    try {
+      const [a, l] = await Promise.all([api('/api/appointments'), leads.length ? Promise.resolve({ leads }) : api('/api/leads')])
+      surveys = a.appointments || []; leads = l.leads || leads
+      renderSurvey()
+      $('svInfo').textContent = `${surveys.length} jadwal · diperbarui ${new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}`
+    } catch (err) { $('svErr').textContent = err.message }
+  }
+  function renderSurvey() {
+    const now = Date.now(), week = now + 7 * 864e5
+    const startToday = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jakarta' })); startToday.setHours(0, 0, 0, 0)
+    const endToday = startToday.getTime() + 864e5
+    const active = surveys.filter(s => !['completed', 'cancelled'].includes(s.status))
+    $('svToday').textContent = active.filter(s => { const t = Date.parse(s.scheduledAt); return t >= startToday.getTime() && t < endToday }).length
+    $('svWeek').textContent = active.filter(s => { const t = Date.parse(s.scheduledAt); return t >= now && t <= week }).length
+    $('svNoPic').textContent = active.filter(s => !s.assignedTo).length
+    $('svAi').textContent = surveys.filter(s => s.source === 'ai').length
+    const filter = $('svFilter').value
+    const list = surveys.filter(s => filter === 'all' ? true : filter === 'done' ? ['completed', 'cancelled'].includes(s.status) : !['completed', 'cancelled'].includes(s.status) && Date.parse(s.scheduledAt) >= now - 864e5)
+      .sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt))
+    const statusLabel = { scheduled: 'Terjadwal', confirmed: 'Dikonfirmasi', completed: 'Selesai', cancelled: 'Batal' }
+    $('svRows').innerHTML = list.map(s => {
+      const lead = leads.find(l => l.id === s.leadId)
+      return `<tr data-id="${esc(s.id)}">
+        <td><b>${fmtWhen(s.scheduledAt)}</b>${s.aiUpdatedAt ? `<div class="muted">AI update ${fmtTime(s.aiUpdatedAt)}</div>` : ''}</td>
+        <td><b>${esc(s.customerName || lead?.name || '-')}</b><div class="muted">${esc(s.phone || lead?.phone || '')}${lead ? ` · <span class="badge ${lead.stage || 'cold'}">${(lead.stage || 'cold').toUpperCase()}</span>` : ''}</div></td>
+        <td>${esc(s.location || '-')}${s.aiNote ? `<div class="muted">${esc(s.aiNote)}</div>` : ''}${s.notes ? `<div class="muted">${esc(s.notes)}</div>` : ''}</td>
+        <td><input type="text" value="${esc(s.assignedTo || '')}" placeholder="Isi PIC…" data-pic="${esc(s.id)}" style="min-width:140px;${s.assignedTo ? '' : 'border-color:#e08a00'}"></td>
+        <td><select data-status="${esc(s.id)}" style="width:auto">${Object.entries(statusLabel).map(([v, t]) => `<option value="${v}" ${s.status === v ? 'selected' : ''}>${t}</option>`).join('')}</select></td>
+        <td>${s.source === 'ai' ? '<span class="badge" style="background:var(--accent)">AI</span>' : '<span class="badge cold">Manual</span>'}</td>
+      </tr>`
+    }).join('') || '<tr><td colspan="6" class="muted">Belum ada jadwal pada filter ini.</td></tr>'
+  }
+  async function updateSurvey(id, patch) {
+    try { const r = await api('/api/appointments/' + encodeURIComponent(id), { method: 'PUT', json: patch }); const i = surveys.findIndex(s => s.id === id); if (i >= 0) surveys[i] = r.appointment; renderSurvey() }
+    catch (err) { $('svErr').textContent = err.message }
+  }
+  $('svRows').addEventListener('change', (e) => {
+    const d = e.target.dataset || {}
+    if (d.pic !== undefined) updateSurvey(d.pic, { assignedTo: e.target.value.trim() })
+    if (d.status !== undefined) updateSurvey(d.status, { status: e.target.value })
+  })
+  $('svRows').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.dataset.pic !== undefined) e.target.blur() })
+  $('svFilter').addEventListener('change', renderSurvey)
+  $('refreshSurvey').addEventListener('click', () => loadSurvey())
+  $('addSurvey').addEventListener('click', () => {
+    const sel = $('svLead'); sel.innerHTML = '<option value="">— tanpa lead —</option>' + leads.map(l => `<option value="${esc(l.id)}">${esc(l.name || l.phone || l.id)}</option>`).join('')
+    $('svForm').hidden = false; $('svForm').scrollIntoView({ behavior: 'smooth' })
+  })
+  $('svCancelAdd').addEventListener('click', () => { $('svForm').hidden = true })
+  $('svLead').addEventListener('change', () => { const l = leads.find(x => x.id === $('svLead').value); if (l) { $('svName').value = l.name || ''; if (l.address) $('svLoc').value = l.address } })
+  $('svAddForm').addEventListener('submit', async (e) => {
+    e.preventDefault(); $('svAddErr').textContent = ''
+    const when = $('svWhen').value; if (!when) return
+    try {
+      await api('/api/appointments', { method: 'POST', json: { leadId: $('svLead').value || undefined, customerName: $('svName').value.trim() || undefined, phone: $('svPhone').value.trim() || undefined, scheduledAt: new Date(when + ':00+07:00').toISOString(), location: $('svLoc').value.trim(), assignedTo: $('svPic').value.trim(), notes: $('svNotes').value.trim() } })
+      $('svAddForm').reset(); $('svForm').hidden = true; loadSurvey()
+    } catch (err) { $('svAddErr').textContent = err.message }
   })
 
   async function loadMedia() {
