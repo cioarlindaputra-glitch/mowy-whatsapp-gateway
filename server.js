@@ -210,7 +210,7 @@ app.use((req, res, next) => {
 let legacyWorkspace = null
 if (legacyOwnerUserId) legacyWorkspace = await loadWorkspace(legacyOwnerUserId)
 
-const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, portfolioMediaReplies: true, leadScoring: leadScoringEnabled }
+const healthStatus = { ok: true, service: 'mowy-whatsapp-gateway', state: 'ready', multiWorkspace: true, brandSessionRestore: true, portfolioMediaReplies: true, leadScoring: leadScoringEnabled }
 app.get('/', (_req, res) => res.json(healthStatus))
 app.get('/health', (_req, res) => res.json(healthStatus))
 
@@ -1483,8 +1483,8 @@ async function handleIncomingMessage(message) {
   const history = recentConversationHistory(jid, message.key.id)
   const answer = await generateAIReply(text, knowledge, behavior, workspace.knowledgeDocuments, config.media, history)
   if (!answer) { console.warn(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'empty_ai_answer' })); return }
-  console.info(JSON.stringify({ event: 'auto_reply_sent', jid, characters: answer.length }))
   const sent = await workspace.socket.sendMessage(message.key.remoteJid, { text: answer })
+  console.info(JSON.stringify({ event: 'auto_reply_sent', characters: answer.length }))
   await saveInboxMessage({ jid, name: message.pushName, text: answer, fromMe: true, timestamp: Date.now(), id: sent?.key?.id })
   for (const file of selectRequestedBusinessMedia(text, config.media)) {
     try { await sendBusinessMedia(workspace.socket, jid, file) }
@@ -1514,7 +1514,31 @@ app.use((req, res) => {
   res.status(404).json({ error: `Route ${req.method} ${req.path} tidak ada di gateway WhatsApp.` })
 })
 
+async function restoreBrandSessions() {
+  const entries = await fs.readdir(workspaceRoot, { withFileTypes: true }).catch(error => {
+    if (error.code === 'ENOENT') return []
+    throw error
+  })
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9a-f-]{36}-brand-[0-9a-f]{64}$/i.test(entry.name)) continue
+    try {
+      await fs.access(path.join(workspacePaths(entry.name).sessionDir, 'creds.json'))
+      const ws = await loadWorkspace(entry.name)
+      if (!ws.starting && !ws.socket && ws.connectionState === 'disconnected') {
+        await workspaceStorage.run(ws, () => startSocket(ws)).catch(error => {
+          ws.starting = false
+          ws.connectionState = 'error'
+          throw error
+        })
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Brand session restore failed:', error.name)
+    }
+  }
+}
+
 app.listen(port, () => {
+  restoreBrandSessions().catch(error => console.error('Brand session discovery failed:', error.name))
   console.log(`Mowy WhatsApp gateway listening on ${port}`)
   if (legacyWorkspace) workspaceStorage.run(legacyWorkspace, () => startSocket(legacyWorkspace)).catch(error => {
       legacyWorkspace.connectionState = 'error'
