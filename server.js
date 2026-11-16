@@ -1,6 +1,6 @@
 import express from 'express'
 import QRCode from 'qrcode'
-import makeWASocket, { Browsers, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys'
+import makeWASocket, { Browsers, downloadContentFromMessage, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys'
 import { createClient } from '@supabase/supabase-js'
 import { Boom } from '@hapi/boom'
 import fs from 'node:fs/promises'
@@ -1167,6 +1167,18 @@ app.post('/api/knowledge/sync', authenticatedUser, async (req, res) => {
   }
 })
 
+app.get('/api/client-photo/:lead/:photo', authenticatedUser, async (req,res)=>{
+  let ws=req.mowyWorkspace
+  if(req.query.brand){
+    const p=(req.mowyUser.user_metadata?.mowy_brand_profiles||[]).find(x=>x.brand===req.query.brand)
+    if(!p)return res.sendStatus(404)
+    ws=await loadWorkspace(req.mowyUser.id+'-brand-'+createHash('sha256').update(String(p.workspaceId||p.brand)).digest('hex'))
+  }
+  const file=ws.leads.get(req.params.lead)?.clientPhotos?.find(x=>x.id===req.params.photo)
+  if(!file||!/^[a-f0-9-]{36}$/.test(file.id))return res.sendStatus(404)
+  res.set({'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}).type(file.mime)
+  return res.sendFile(path.join(ws.files.dataDir,'client-photos',file.id))
+})
 app.get('/api/brand-workspace', authenticatedUser, async (req,res)=>{
   const profile=(req.mowyUser.user_metadata?.mowy_brand_profiles||[]).find(p=>p.brand===req.query.brand)
   if(!profile)return res.sendStatus(404)
@@ -1306,6 +1318,7 @@ async function startSocket(workspace = currentWorkspace()) {
   }))
 }
 
+function inboundImage(message){const m=message.message?.ephemeralMessage?.message||message.message;return m?.imageMessage}
 function extractText(message) {
   const content = message.message
   return (content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.videoMessage?.caption || content.documentMessage?.caption || '').trim().slice(0, 4000)
@@ -1444,7 +1457,8 @@ async function sendBusinessMedia(socket, jid, file) {
 }
 
 async function handleIncomingMessage(message) {
-  const text = extractText(message)
+  const photo=inboundImage(message)
+  const text = extractText(message) || (photo?'[Foto pelanggan]':'')
   const workspace = currentWorkspace()
   const jid = message.key.remoteJid
   if (!text || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') {
@@ -1455,6 +1469,18 @@ async function handleIncomingMessage(message) {
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
   await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id })
   await upsertLeadFromMessage({ jid, name: message.pushName, text, timestamp, messageId: message.key.id })
+  if(photo){
+    try {
+      const lead=leads.get(jid), limit=8*1024*1024
+      if(lead && Number(photo.fileLength||0)<=limit && (lead.clientPhotos||[]).length<100 && !(lead.clientPhotos||[]).some(p=>p.messageId===message.key.id)){
+        const stream=await downloadContentFromMessage(photo,'image'), chunks=[]
+        let bytes=0
+        for await(const chunk of stream){bytes+=chunk.length;if(bytes>limit)throw Error('image_limit');chunks.push(chunk)}
+        const buf=Buffer.concat(chunks), mime=buf[0]===255&&buf[1]===216?'image/jpeg':buf.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex'))?'image/png':buf.toString('ascii',0,4)==='RIFF'&&buf.toString('ascii',8,12)==='WEBP'?'image/webp':null
+        if(mime){const id=randomUUID(),dir=path.join(workspace.files.dataDir,'client-photos');await fs.mkdir(dir,{recursive:true});await fs.writeFile(path.join(dir,id),buf,{mode:0o600,flag:'wx'});(lead.clientPhotos||=[]).push({id,mime,timestamp,messageId:message.key.id});await persistLeads()}
+      }
+    }catch(error){console.warn('Customer image not saved:',error.name)}
+  }
   // Scoring dijalankan terpisah (debounce 8 detik) supaya balasan AI tidak tertunda
   // dan transkrip sudah memuat balasan CS terakhir.
   scheduleLeadScoring(jid, 8000)
