@@ -8,7 +8,7 @@ import { createWriteStream } from 'node:fs'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
 const required = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'OPENAI_API_KEY']
@@ -1165,6 +1165,27 @@ app.post('/api/knowledge/sync', authenticatedUser, async (req, res) => {
     console.error('Document knowledge sync failed:', error instanceof Error ? error.message : 'unknown')
     res.status(502).json({ error: 'Dokumen tersimpan, tetapi analisis gagal. Periksa OPENAI_API_KEY dan log gateway, lalu klik Simpan data untuk mencoba lagi.' })
   }
+})
+
+app.get('/api/brand-workspace', authenticatedUser, async (req,res)=>{
+  const profile=(req.mowyUser.user_metadata?.mowy_brand_profiles||[]).find(p=>p.brand===req.query.brand)
+  if(!profile)return res.sendStatus(404)
+  const id=profile.workspaceId||profile.brand
+  const ws=await loadWorkspace(req.mowyUser.id+'-brand-'+createHash('sha256').update(String(id)).digest('hex'))
+  res.set('Cache-Control','no-store').json({brand:profile.brand,chats:[...ws.inboxChats.values()].map(c=>({...inboxSummary(c),messages:c.messages})),leads:[...ws.leads.values()],appointments:[...ws.appointments.values()]})
+})
+app.all('/api/brand-whatsapp/:action', authenticatedUser, async (req,res)=>{
+  const brand=(req.mowyUser.user_metadata?.mowy_brand_profiles||[]).find(b=>b.brand===req.query.brand)
+  if(!brand)return res.sendStatus(404)
+  const ws=await loadWorkspace(req.mowyUser.id+'-brand-'+createHash('sha256').update(String(brand.workspaceId||brand.brand)).digest('hex'))
+  res.set('Cache-Control','no-store')
+  if(req.method==='POST'&&req.params.action==='connect'){
+    if(!ws.starting&&!['connected','connecting','qr'].includes(ws.connectionState)){
+      await fs.mkdir(ws.files.sessionDir,{recursive:true})
+      workspaceStorage.run(ws,()=>startSocket(ws)).catch(()=>{ws.starting=false;ws.connectionState='error'})
+    }
+  }else if(!(req.method==='GET'&&req.params.action==='status'))return res.sendStatus(405)
+  res.json({brand:brand.brand,state:ws.connectionState,qrDataUrl:ws.qrDataUrl,phone:ws.socket?.user?.id?.split(':')[0]||null})
 })
 
 app.get('/api/whatsapp/status', authenticatedUser, (req, res) => {
