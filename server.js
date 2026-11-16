@@ -1185,6 +1185,10 @@ app.all('/api/brand-whatsapp/:action', authenticatedUser, async (req,res)=>{
       workspaceStorage.run(ws,()=>startSocket(ws)).catch(()=>{ws.starting=false;ws.connectionState='error'})
     }
   }else if(!(req.method==='GET'&&req.params.action==='status'))return res.sendStatus(405)
+  if(req.method==='GET' && ws.connectionState==='disconnected' && !ws.socket && !ws.starting){
+    const saved=await fs.access(path.join(ws.files.sessionDir,'creds.json')).then(()=>true,()=>false)
+    if(saved && !ws.starting)workspaceStorage.run(ws,()=>startSocket(ws)).catch(()=>{ws.starting=false;ws.connectionState='error'})
+  }
   res.json({brand:brand.brand,state:ws.connectionState,qrDataUrl:ws.qrDataUrl,phone:ws.socket?.user?.id?.split(':')[0]||null})
 })
 
@@ -1465,9 +1469,13 @@ async function handleIncomingMessage(message) {
     return
   }
   if (optedOutJids.has(jid)) return
-  const { data, error } = await adminClient.auth.admin.getUserById(workspace.userId)
+  const brandKey = workspace.userId.match(/^([0-9a-f-]{36})-brand-([0-9a-f]{64})$/i)
+  const { data, error } = await adminClient.auth.admin.getUserById(brandKey ? brandKey[1] : workspace.userId)
   if (error || !data.user) throw new Error('Workspace owner could not be loaded')
-  const config = data.user.user_metadata?.mowy_config || {}
+  const meta = data.user.user_metadata || {}
+  const profile = brandKey && (meta.mowy_brand_profiles || []).find(p => createHash('sha256').update(String(p.workspaceId || p.brand)).digest('hex') === brandKey[2])
+  if (brandKey && !profile) return
+  const config = profile ? { knowledge: {company:profile.brand,website:profile.website,services:profile.knowledge,location:profile.location,faqs:profile.faqs||[]},behavior:{aiName:profile.agentName,customBehavior:profile.behavior,autoReply:profile.autoReply ?? (/^the one interior$/i.test(profile.brand) && /^tika$/i.test(profile.agentName||''))},media:(profile.materials||[]).map(m=>({...m,type:'link'})) } : meta.mowy_config || {}
   const knowledge = config.knowledge || {}
   const behavior = config.behavior || {}
   if (behavior.autoReply !== true) { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'auto_reply_off' })); return }
