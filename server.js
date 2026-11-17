@@ -232,7 +232,7 @@ app.get('/panel', async (_req, res) => {
 
 // Only these CRM actions may be routed to an owned secondary brand.
 app.use('/api/brand-actions/:brand', (req,res,next)=>{
-  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect']}
+  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
   if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
   req.mowyBrandName=req.params.brand
   const target='/api'+req.url
@@ -1112,6 +1112,36 @@ app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
   }
 })
 
+const metaPending=new Map()
+const metaCallback='https://mowy-whatsapp-gateway.onrender.com/api/meta-ads/callback'
+const metaAppOrigin='https://mowy-cs-ai.jellyjelley17.chatgpt.site'
+const metaNonce=()=>randomBytes(32).toString('hex')
+setInterval(()=>{for(const [key,x] of metaPending)if(x.until<Date.now())metaPending.delete(key)},60000).unref()
+app.post('/api/meta-ads/login',authenticatedUser,(req,res)=>{
+ const appId=process.env.META_APP_ID,config=process.env.META_LOGIN_CONFIG_ID
+ if(!appId||!process.env.META_APP_SECRET||!config)return res.status(503).json({error:'Login Meta belum diaktifkan oleh admin Mowy. Untuk melihat data sekarang, buka Meta Ads Manager.'})
+ const state=metaNonce(),ws=req.mowyWorkspace.userId
+ for(const [k,x] of metaPending)if(x.ws===ws)metaPending.delete(k)
+ metaPending.set(state,{ws,until:Date.now()+600000})
+ const url=new URL('https://www.facebook.com/v27.0/dialog/oauth');url.search=new URLSearchParams({client_id:appId,config_id:config,response_type:'code',redirect_uri:metaCallback,state}).toString()
+ res.set('Cache-Control','no-store').json({url:url.href})
+})
+app.get('/api/meta-ads/callback',async(req,res)=>{
+ const state=String(req.query.state||''),item=metaPending.get(state);metaPending.delete(state)
+ res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer'})
+ if(!item||item.until<Date.now()||!req.query.code)return res.status(400).send('Login dibatalkan atau kedaluwarsa. Kembali ke Mowy.')
+ try{const r=await fetch('https://graph.facebook.com/v27.0/oauth/access_token',{method:'POST',body:new URLSearchParams({client_id:process.env.META_APP_ID,client_secret:process.env.META_APP_SECRET,redirect_uri:metaCallback,code:String(req.query.code)}),signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||!d.access_token)throw Error()
+ const proof=metaNonce();metaPending.set(proof,{...item,token:d.access_token});res.type('html').send('<p>Kembali ke Mowy untuk memilih akun iklan. Jika jendela ini tetap terbuka, tutup lalu ulangi login.</p><script>if(window.opener){window.opener.postMessage({kind:"mowy-meta",proof:'+JSON.stringify(proof)+'},'+JSON.stringify(metaAppOrigin)+');window.close()}</script>')
+ }catch{res.status(502).send('Meta belum menyelesaikan login. Kembali ke Mowy dan coba lagi.')}
+})
+for(const action of ['accounts','select'])app.post('/api/meta-ads/'+action,authenticatedUser,async(req,res)=>{
+ const key=String(req.body?.proof||''),item=metaPending.get(key),ws=req.mowyWorkspace
+ if(!item?.token||item.ws!==ws.userId||item.until<Date.now())return res.status(403).json({error:'Sesi login berakhir. Masuk lagi dengan Facebook.'})
+ try{if(action==='accounts'){const list=[];let after='';for(let n=0;n<20;n++){const url=new URL('https://graph.facebook.com/v27.0/me/adaccounts');url.search=new URLSearchParams({fields:'account_id,name',limit:'100',...(after?{after}:{})});const r=await fetch(url,{headers:{Authorization:'Bearer '+item.token},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||!Array.isArray(d.data))throw Error();list.push(...d.data.map(x=>({id:String(x.account_id),name:String(x.name)})));after=d.paging?.next&&d.paging?.cursors?.after;if(!after)break}item.accounts=list;return res.set('Cache-Control','no-store').json({accounts:list})}
+ const account=item.accounts?.find(x=>x.id===String(req.body?.accountId));if(!account)return res.sendStatus(400)
+ const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',metaKey(ws),iv),secret=Buffer.concat([c.update(item.token),c.final()]);await writeMeta(ws,{accountId:account.id,name:account.name,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),secret:secret.toString('base64')});metaPending.delete(key);res.json({connected:true,accountId:account.id,name:account.name})
+ }catch{res.status(502).json({error:'Akun iklan gagal diproses. Periksa izin baca iklan di Meta.'})}
+})
 function metaFile(ws){return path.join(ws.files.dataDir,'meta-connection.json')}
 function metaKey(ws){return hkdfSync('sha256',process.env.META_CONNECTION_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY,'mowy-meta-v1',ws.userId,32)}
 async function metaConfig(req){
