@@ -232,7 +232,7 @@ app.get('/panel', async (_req, res) => {
 
 // Only these CRM actions may be routed to an owned secondary brand.
 app.use('/api/brand-actions/:brand', (req,res,next)=>{
-  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
+  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/performance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
   if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
   req.mowyBrandName=req.params.brand
   const target='/api'+req.url
@@ -1157,6 +1157,15 @@ app.post('/api/meta-ads/connection',authenticatedUser,async(req,res)=>{const acc
  const ws=req.mowyWorkspace,iv=randomBytes(12),c=createCipheriv('aes-256-gcm',metaKey(ws),iv),secret=Buffer.concat([c.update(token,'utf8'),c.final()]);await writeMeta(ws,{accountId,name:d.name,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),secret:secret.toString('base64')});res.json({connected:true,name:d.name,accountId})
  }catch{res.status(503).json({error:'Koneksi belum tersimpan. Coba lagi.'})}})
 app.post('/api/meta-ads/disconnect',authenticatedUser,async(req,res)=>{try{await writeMeta(req.mowyWorkspace,{disabled:true});res.json({connected:false})}catch{res.status(503).json({error:'Koneksi gagal dilepas.'})}})
+app.get('/api/meta-ads/performance',authenticatedUser,async(req,res)=>{
+ const period=req.query.period||'this_month';if(!['today','last_7d','this_month','last_month'].includes(period))return res.status(400).json({error:'Periode tidak valid.'})
+ try{const {accountId,accessToken}=await metaConfig(req);if(!accountId||!accessToken)return res.status(409).json({error:'Hubungkan akun Meta Ads brand ini di Data Bisnis.'})
+ const url=new URL('https://graph.facebook.com/v27.0/act_'+accountId+'/insights');url.search=new URLSearchParams({level:'account',date_preset:period,fields:'account_name,account_currency,date_start,date_stop,spend,actions'})
+ const r=await fetch(url,{headers:{Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||!Array.isArray(d.data))throw Error()
+ const row=d.data[0]||{},actions=row.actions||[],count=t=>Number(actions.find(x=>x.action_type===t)?.value||0)
+ res.set('Cache-Control','no-store').json({spend:Number(row.spend||0),currency:row.account_currency||null,leads:count('lead'),conversations:count('onsite_conversion.messaging_conversation_started_7d'),start:row.date_start,end:row.date_stop,account:row.account_name||accountId})
+ }catch{res.status(502).json({error:'Laporan Meta belum dapat dimuat. Periksa koneksi dan izin baca iklan.'})}
+})
 app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
   if (!requireOwner(req,res))return
   let config;try{config=await metaConfig(req)}catch{return res.status(503).json({error:'Koneksi Meta perlu diperiksa di Data Bisnis.'})}
@@ -1600,6 +1609,10 @@ async function handleIncomingMessage(message) {
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
   await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id })
   await upsertLeadFromMessage({ jid, name: message.pushName, text, timestamp, messageId: message.key.id })
+  const content=message.message?.ephemeralMessage?.message||message.message||{}
+  const adsReferral=Object.values(content).some(part=>{const ad=part?.contextInfo?.externalAdReply;return !!ad&&(!!ad.ctwaClid||String(ad.sourceType||'').toLowerCase()==='ad')})
+  const adLead=leads.get(jid)
+  if(adsReferral&&adLead&&!adLead.firstAdAt){adLead.firstAdAt=timestamp;if(!adLead.source)adLead.source='WhatsApp Lead Ads';await persistLeads()}
   if(photo){
     try {
       const lead=leads.get(jid), limit=8*1024*1024
