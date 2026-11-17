@@ -412,7 +412,7 @@ function safeLeadUpdate(lead, input = {}) {
     const aiScores = lead.aiProfileScores || {}
     lead.manualProfileKeys = Object.keys(scores).filter(key => scores[key] !== Boolean(aiScores[key]))
   }
-  if (['new', 'contacted', 'qualified', 'survey_scheduled', 'won', 'lost'].includes(input.status)) lead.status = input.status
+  if (['new', 'contacted', 'qualified', 'survey_scheduled', 'survey_completed', 'won', 'lost'].includes(input.status)) lead.status = input.status
   // Toggle balasan AI per lead. aiReply=false berarti percakapan di-handover ke tim:
   // pesan tetap dicatat di inbox/lead, tetapi AI tidak membalas.
   if (typeof input.aiReply === 'boolean') {
@@ -995,7 +995,7 @@ app.post('/api/appointments', authenticatedUser, async (req, res) => {
     appointment.createdAt = Date.now()
     appointments.set(appointment.id, appointment)
     if (linkedLead) {
-      linkedLead.status = 'survey_scheduled'
+      linkedLead.status = appointment.status === 'completed' ? 'survey_completed' : appointment.status === 'cancelled' ? 'qualified' : 'survey_scheduled'
       linkedLead.updatedAt = Date.now()
       await persistLeads()
     }
@@ -1012,6 +1012,14 @@ app.put('/api/appointments/:id', authenticatedUser, async (req, res) => {
   if (!appointment) return res.status(404).json({ error: 'Jadwal survei tidak ditemukan.' })
   try {
     Object.assign(appointment, cleanAppointment(req.body || {}, appointment))
+    const linkedLead = appointment.leadId ? leads.get(appointment.leadId) : null
+    if (linkedLead) {
+      if (appointment.status === 'completed') linkedLead.status = 'survey_completed'
+      else if (appointment.status === 'cancelled' && linkedLead.status === 'survey_scheduled') linkedLead.status = 'qualified'
+      else if (['scheduled', 'confirmed'].includes(appointment.status)) linkedLead.status = 'survey_scheduled'
+      linkedLead.updatedAt = Date.now()
+      await persistLeads()
+    }
     await persistAppointments()
     res.json({ appointment })
   } catch (error) {
@@ -1050,6 +1058,72 @@ app.post('/api/inbox/reply', authenticatedUser, async (req, res) => {
   } catch (error) {
     console.error('Inbox reply failed:', error instanceof Error ? error.message : 'unknown')
     res.status(502).json({ error: 'Balasan gagal dikirim melalui WhatsApp.' })
+  }
+})
+
+app.get('/api/whatsapp/groups', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireInboxOwner(req, res)) return
+  const socket = currentWorkspace().socket
+  if (!socket || currentWorkspace().connectionState !== 'connected') return res.status(409).json({ error: 'WhatsApp belum tersambung.' })
+  try {
+    const groups = await socket.groupFetchAllParticipating()
+    res.set('Cache-Control', 'no-store').json({ groups: Object.entries(groups || {}).map(([jid, group]) => ({ jid, name: String(group.subject || 'Grup WhatsApp').slice(0, 120), participants: Array.isArray(group.participants) ? group.participants.length : 0 })).sort((a, b) => a.name.localeCompare(b.name, 'id')) })
+  } catch (error) {
+    console.error('WhatsApp group list failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(502).json({ error: 'Daftar grup WhatsApp gagal dimuat.' })
+  }
+})
+
+app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireInboxOwner(req, res)) return
+  const jid = String(req.body?.jid || '')
+  const fileName = path.basename(String(req.body?.fileName || 'Resume_Profiling.pdf')).replace(/[^\\p{L}\\p{N}._ -]/gu, '_').slice(0, 120)
+  const caption = typeof req.body?.caption === 'string' ? req.body.caption.trim().slice(0, 500) : ''
+  const encoded = typeof req.body?.data === 'string' ? req.body.data : ''
+  if (!jid.endsWith('@g.us')) return res.status(400).json({ error: 'Pilih grup WhatsApp tujuan.' })
+  if (req.body?.mimeType !== 'application/pdf' || !fileName.toLowerCase().endsWith('.pdf')) return res.status(415).json({ error: 'Resume harus berupa PDF.' })
+  if (!encoded || encoded.length > 480000 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) return res.status(413).json({ error: 'File PDF kosong atau terlalu besar.' })
+  const pdf = Buffer.from(encoded, 'base64')
+  if (!pdf.length || pdf.length > 350 * 1024 || pdf.subarray(0, 5).toString() !== '%PDF-') return res.status(400).json({ error: 'Isi file PDF tidak valid.' })
+  const socket = currentWorkspace().socket
+  if (!socket || currentWorkspace().connectionState !== 'connected') return res.status(409).json({ error: 'WhatsApp sedang tidak tersambung.' })
+  try {
+    const groups = await socket.groupFetchAllParticipating()
+    const group = groups?.[jid]
+    if (!group) return res.status(404).json({ error: 'Grup tujuan tidak ditemukan pada nomor WhatsApp yang tersambung.' })
+    const sent = await socket.sendMessage(jid, { document: pdf, mimetype: 'application/pdf', fileName, caption })
+    await saveInboxMessage({ jid, name: group.subject || 'Grup WhatsApp', text: `[Resume profiling dikirim] ${fileName}`, fromMe: true, timestamp: Date.now(), id: sent?.key?.id })
+    res.json({ sent: true, jid, fileName })
+  } catch (error) {
+    console.error('WhatsApp group document send failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(502).json({ error: 'Resume PDF gagal dikirim ke grup WhatsApp.' })
+  }
+})
+
+app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res)) return
+  const accountId = String(process.env.META_AD_ACCOUNT_ID || '').replace(/^act_/, '')
+  const accessToken = process.env.META_ACCESS_TOKEN
+  if (!/^\\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Koneksi Meta Ads belum diatur di environment backend Render.' })
+  try {
+    const url = new URL(`https://graph.facebook.com/v27.0/act_${accountId}`)
+    url.searchParams.set('fields', 'name,account_id,balance,amount_spent,spend_cap,currency,account_status')
+    url.searchParams.set('access_token', accessToken)
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(12000) })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.error) {
+      console.warn('Meta Ads balance request failed:', result.error?.code || response.status)
+      return res.status(502).json({ error: 'Meta Ads tidak mengizinkan pembacaan akun. Periksa token, ID akun, dan izin ads_read.' })
+    }
+    const currency = String(result.currency || 'IDR')
+    const decimals = new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits
+    const amount = value => Number.isFinite(Number(value)) ? Number(value) / (10 ** decimals) : null
+    const spendCap = amount(result.spend_cap)
+    const amountSpent = amount(result.amount_spent)
+    res.set('Cache-Control', 'no-store').json({ accountId: result.account_id, accountName: result.name || '', currency, spendCap, amountSpent, remainingLimit: spendCap > 0 && amountSpent !== null ? Math.max(0, spendCap - amountSpent) : null, balanceDue: amount(result.balance), accountStatus: result.account_status, updatedAt: new Date().toISOString() })
+  } catch (error) {
+    console.error('Meta Ads balance fetch failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(502).json({ error: 'Saldo Meta Ads gagal diperbarui. Periksa koneksi gateway.' })
   }
 })
 
