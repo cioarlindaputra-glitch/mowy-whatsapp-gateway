@@ -1077,7 +1077,7 @@ app.get('/api/whatsapp/groups', authenticatedUser, async (req, res) => {
 app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
   if (!requireOwner(req, res) || !requireInboxOwner(req, res)) return
   const jid = String(req.body?.jid || '')
-  const fileName = path.basename(String(req.body?.fileName || 'Resume_Profiling.pdf')).replace(/[^\\p{L}\\p{N}._ -]/gu, '_').slice(0, 120)
+  const fileName = path.basename(String(req.body?.fileName || 'Resume_Profiling.pdf')).replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 120)
   const caption = typeof req.body?.caption === 'string' ? req.body.caption.trim().slice(0, 500) : ''
   const encoded = typeof req.body?.data === 'string' ? req.body.data : ''
   if (!jid.endsWith('@g.us')) return res.status(400).json({ error: 'Pilih grup WhatsApp tujuan.' })
@@ -1104,7 +1104,7 @@ app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
   if (!requireOwner(req, res)) return
   const accountId = String(process.env.META_AD_ACCOUNT_ID || '').replace(/^act_/, '')
   const accessToken = process.env.META_ACCESS_TOKEN
-  if (!/^\\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Koneksi Meta Ads belum diatur di environment backend Render.' })
+  if (!/^\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Koneksi Meta Ads belum diatur di environment backend Render.' })
   try {
     const url = new URL(`https://graph.facebook.com/v27.0/act_${accountId}`)
     url.searchParams.set('fields', 'name,account_id,balance,amount_spent,spend_cap,currency,account_status')
