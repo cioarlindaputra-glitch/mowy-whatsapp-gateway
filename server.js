@@ -62,7 +62,6 @@ const leads = proxyForMap('leads')
 
 const appointments = proxyForMap('appointments')
 const businessMedia = proxyForMap('businessMedia')
-const authClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } })
 const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
 app.disable('x-powered-by')
@@ -244,8 +243,12 @@ async function authenticatedUser(req, res, next) {
   try {
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
     if (!token) { if (isRawUploadPath(req)) await drainRequest(req); return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' }) }
-    const { data, error } = await authClient.auth.getUser(token)
-    if (error || !data.user) { if (isRawUploadPath(req)) await drainRequest(req); return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' }) }
+    const { data, error } = await adminClient.auth.getUser(token)
+    if (error || !data.user) {
+      console.warn(JSON.stringify({ event: 'auth_rejected', path: req.path, status: error?.status || null, code: error?.code || null, message: error?.message || null }))
+      if (isRawUploadPath(req)) await drainRequest(req)
+      return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' })
+    }
 
     req.mowyUser = data.user
     let workspaceId=data.user.id
