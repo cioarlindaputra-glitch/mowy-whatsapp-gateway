@@ -404,6 +404,7 @@ async function backfillLeadsFromInbox() {
 }
 
 function safeLeadUpdate(lead, input = {}) {
+  if (['','Hanya tanya','Survei terjadwal','Sudah survei','RAB terbit','CF dibayar'].includes(input.manualStage)) lead.manualStage=input.manualStage
   const fields = ['name', 'customerName', 'phone', 'address', 'rooms', 'estimatedSize', 'projectType', 'area', 'budget', 'style', 'scope', 'commitmentFee', 'notes']
   for (const field of fields) {
     if (typeof input[field] === 'string') lead[field] = input[field].trim().slice(0, field === 'notes' ? 2000 : field === 'address' ? 500 : 300)
