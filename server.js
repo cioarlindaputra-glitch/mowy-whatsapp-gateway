@@ -230,6 +230,16 @@ app.get('/panel', async (_req, res) => {
   }
 })
 
+// Only these CRM actions may be routed to an owned secondary brand.
+app.use('/api/brand-actions/:brand', (req,res,next)=>{
+  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/appointments'],POST:['/inbox/reply','/whatsapp/send-document']}
+  if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
+  req.mowyBrandName=req.params.brand
+  const target='/api'+req.url
+  // Mounted middleware restores its prefix on next(); dispatch the canonical route instead.
+  req.url=target
+  app.handle(req,res)
+})
 async function authenticatedUser(req, res, next) {
   try {
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
@@ -238,7 +248,9 @@ async function authenticatedUser(req, res, next) {
     if (error || !data.user) { if (isRawUploadPath(req)) await drainRequest(req); return res.status(401).json({ error: 'Sesi login tidak valid. Silakan masuk ulang.' }) }
 
     req.mowyUser = data.user
-    req.mowyWorkspace = await loadWorkspace(data.user.id)
+    let workspaceId=data.user.id
+    if(req.mowyBrandName){const profile=(data.user.user_metadata?.mowy_brand_profiles||[]).find(x=>x.brand===req.mowyBrandName);if(!profile)return res.sendStatus(404);workspaceId+='-brand-'+createHash('sha256').update(String(profile.workspaceId||profile.brand)).digest('hex');req.verifiedBrandWorkspace=workspaceId}
+    req.mowyWorkspace = await loadWorkspace(workspaceId)
     workspaceStorage.run(req.mowyWorkspace, next)
   } catch (error) {
     console.error('Authentication failed:', error instanceof Error ? error.message : 'unknown')
@@ -247,7 +259,7 @@ async function authenticatedUser(req, res, next) {
 }
 
 function requireOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -255,7 +267,7 @@ function requireOwner(req, res) {
 }
 
 function requireKnowledgeOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -263,7 +275,7 @@ function requireKnowledgeOwner(req, res) {
 }
 
 function requireInboxOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -271,7 +283,7 @@ function requireInboxOwner(req, res) {
 }
 
 function requireLeadOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -279,7 +291,7 @@ function requireLeadOwner(req, res) {
 }
 
 function requireMediaOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -287,7 +299,7 @@ function requireMediaOwner(req, res) {
 }
 
 function requireAppointmentOwner(req, res) {
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) {
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) {
     res.status(403).json({ error: 'Workspace tidak valid.' })
     return false
   }
@@ -661,7 +673,7 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
   const contentLength = Number(req.headers['content-length'] || 0)
   console.info(JSON.stringify({ event: 'media_upload_received', contentType: contentType.split(';')[0], contentLength, fileType: req.headers['x-file-type'] || null, category: req.headers['x-media-category'] || null, hasName: Boolean(req.headers['x-media-name']) }))
   const reject = async (status, error) => { await drainRequest(req); return res.status(status).json({ error }) }
-  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== req.mowyUser.id) return reject(403, 'Workspace tidak valid.')
+  if (!req.mowyWorkspace || req.mowyWorkspace.userId !== (req.verifiedBrandWorkspace || req.mowyUser.id)) return reject(403, 'Workspace tidak valid.')
   if (contentLength > maxMediaBytes) return reject(413, 'Ukuran file maksimal 200 MB.')
   const headerMime = String(req.headers['x-file-type'] || '').toLowerCase()
   let mimeType = headerMime, category = safeHeader(req, 'x-media-category', 40), name = safeHeader(req, 'x-media-name', 180)
@@ -1102,7 +1114,8 @@ app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
 
 app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
   if (!requireOwner(req, res)) return
-  const accountId = String(process.env.META_AD_ACCOUNT_ID || '').replace(/^act_/, '')
+  const map=JSON.parse(process.env.META_AD_ACCOUNTS_BY_WORKSPACE||'{}')
+  const accountId = String(map[req.mowyWorkspace.userId] || (!req.verifiedBrandWorkspace && req.mowyUser.id===legacyOwnerUserId ? process.env.META_AD_ACCOUNT_ID : '') || '').replace(/^act_/, '')
   const accessToken = process.env.META_ACCESS_TOKEN
   if (!/^\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Koneksi Meta Ads belum diatur di environment backend Render.' })
   try {
