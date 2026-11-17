@@ -8,7 +8,7 @@ import { createWriteStream } from 'node:fs'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import path from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
+import { createCipheriv, createDecipheriv, randomBytes, hkdfSync, createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
 const required = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'OPENAI_API_KEY']
@@ -232,7 +232,7 @@ app.get('/panel', async (_req, res) => {
 
 // Only these CRM actions may be routed to an owned secondary brand.
 app.use('/api/brand-actions/:brand', (req,res,next)=>{
-  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/appointments'],POST:['/inbox/reply','/whatsapp/send-document']}
+  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect']}
   if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
   req.mowyBrandName=req.params.brand
   const target='/api'+req.url
@@ -1112,17 +1112,31 @@ app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
   }
 })
 
+function metaFile(ws){return path.join(ws.files.dataDir,'meta-connection.json')}
+function metaKey(ws){return hkdfSync('sha256',process.env.META_CONNECTION_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY,'mowy-meta-v1',ws.userId,32)}
+async function metaConfig(req){
+ const ws=req.mowyWorkspace;let row
+ try{row=JSON.parse(await fs.readFile(metaFile(ws),'utf8'))}catch(e){if(e.code!=='ENOENT')throw e}
+ if(row){if(row.disabled)return {};const decipher=createDecipheriv('aes-256-gcm',metaKey(ws),Buffer.from(row.iv,'base64'));decipher.setAuthTag(Buffer.from(row.tag,'base64'));return {...row,accessToken:Buffer.concat([decipher.update(Buffer.from(row.secret,'base64')),decipher.final()]).toString()}}
+ const map=JSON.parse(process.env.META_AD_ACCOUNTS_BY_WORKSPACE||'{}'),accountId=String(map[ws.userId]||(!req.verifiedBrandWorkspace&&req.mowyUser.id===legacyOwnerUserId?process.env.META_AD_ACCOUNT_ID:'')||'').replace(/^act_/,'');return {accountId,accessToken:process.env.META_ACCESS_TOKEN}
+}
+async function writeMeta(ws,row){await fs.mkdir(ws.files.dataDir,{recursive:true});const tmp=metaFile(ws)+'.'+randomUUID();await fs.writeFile(tmp,JSON.stringify(row),{flag:'wx',mode:0o600});await fs.rename(tmp,metaFile(ws))}
+app.get('/api/meta-ads/connection',authenticatedUser,async(req,res)=>{try{const c=await metaConfig(req);res.set('Cache-Control','no-store').json({connected:!!(c.accountId&&c.accessToken),accountId:c.accountId||'',name:c.name||''})}catch{res.status(503).json({error:'Pengaturan Meta belum bisa dibaca.'})}})
+app.post('/api/meta-ads/connection',authenticatedUser,async(req,res)=>{const accountId=String(req.body?.accountId||'').trim().replace(/^act_/,''),token=String(req.body?.token||'').trim();if(!/^\d{1,25}$/.test(accountId)||!token||token.length>6000)return res.status(400).json({error:'Periksa ID akun iklan dan token akses.'});try{
+ const r=await fetch('https://graph.facebook.com/v27.0/act_'+accountId+'?fields=name,account_id,amount_spent,currency',{headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||String(d.account_id)!==accountId)return res.status(422).json({error:'Meta tidak memberi akses ke akun ini. Periksa ID akun, masa berlaku token, dan izin ads_read.'})
+ const ws=req.mowyWorkspace,iv=randomBytes(12),c=createCipheriv('aes-256-gcm',metaKey(ws),iv),secret=Buffer.concat([c.update(token,'utf8'),c.final()]);await writeMeta(ws,{accountId,name:d.name,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),secret:secret.toString('base64')});res.json({connected:true,name:d.name,accountId})
+ }catch{res.status(503).json({error:'Koneksi belum tersimpan. Coba lagi.'})}})
+app.post('/api/meta-ads/disconnect',authenticatedUser,async(req,res)=>{try{await writeMeta(req.mowyWorkspace,{disabled:true});res.json({connected:false})}catch{res.status(503).json({error:'Koneksi gagal dilepas.'})}})
 app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
-  if (!requireOwner(req, res)) return
-  const map=JSON.parse(process.env.META_AD_ACCOUNTS_BY_WORKSPACE||'{}')
-  const accountId = String(map[req.mowyWorkspace.userId] || (!req.verifiedBrandWorkspace && req.mowyUser.id===legacyOwnerUserId ? process.env.META_AD_ACCOUNT_ID : '') || '').replace(/^act_/, '')
-  const accessToken = process.env.META_ACCESS_TOKEN
-  if (!/^\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Koneksi Meta Ads belum diatur di environment backend Render.' })
+  if (!requireOwner(req,res))return
+  let config;try{config=await metaConfig(req)}catch{return res.status(503).json({error:'Koneksi Meta perlu diperiksa di Data Bisnis.'})}
+  const {accountId,accessToken}=config
+  if (!/^\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Hubungkan akun Meta Ads brand ini di Data Bisnis.' })
   try {
     const url = new URL(`https://graph.facebook.com/v27.0/act_${accountId}`)
     url.searchParams.set('fields', 'name,account_id,balance,amount_spent,spend_cap,currency,account_status')
-    url.searchParams.set('access_token', accessToken)
-    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(12000) })
+    
+    const response = await fetch(url, { headers: { Accept: 'application/json', Authorization:'Bearer '+accessToken }, signal: AbortSignal.timeout(12000) })
     const result = await response.json().catch(() => ({}))
     if (!response.ok || result.error) {
       console.warn('Meta Ads balance request failed:', result.error?.code || response.status)
