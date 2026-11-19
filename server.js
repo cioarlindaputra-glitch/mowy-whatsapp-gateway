@@ -992,9 +992,34 @@ app.get('/api/leads/:id/layout/:fileId', authenticatedUser, async (req, res) => 
 })
 
 
-app.get('/api/appointments', authenticatedUser, (req, res) => {
+function trustedLeadPhone(lead) {
+  const jid = String(lead?.jid || lead?.id || '')
+  const digits = String(lead?.phone || '').replace(/\D/g, '')
+  if (digits.length < 8 || digits.length > 15) return ''
+  if (jid.endsWith('@lid') && digits === jid.split('@')[0].replace(/\D/g, '')) return ''
+  return String(lead.phone || '').trim()
+}
+
+app.get('/api/appointments', authenticatedUser, async (req, res) => {
   if (!requireAppointmentOwner(req, res)) return
-  res.json({ appointments: [...appointments.values()].sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt)) })
+  let normalized = false
+  for (const appointment of appointments.values()) {
+    const lead = appointment.leadId ? leads.get(appointment.leadId) : null
+    if (!lead || !String(lead.jid || '').endsWith('@lid')) continue
+    const lidDigits = String(lead.jid).split('@')[0].replace(/\D/g, '')
+    const appointmentDigits = String(appointment.phone || '').replace(/\D/g, '')
+    if (appointmentDigits === lidDigits || !appointment.phone) {
+      const actualPhone = trustedLeadPhone(lead)
+      if (appointment.phone !== actualPhone) { appointment.phone = actualPhone; normalized = true }
+    }
+    const customerDigits = String(appointment.customerName || '').replace(/\D/g, '')
+    if (customerDigits && customerDigits === lidDigits && (lead.customerName || lead.name)) {
+      appointment.customerName = lead.customerName || lead.name
+      normalized = true
+    }
+  }
+  if (normalized) await persistAppointments()
+  res.set('Cache-Control', 'no-store').json({ appointments: [...appointments.values()].sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt)) })
 })
 
 app.post('/api/appointments', authenticatedUser, async (req, res) => {
@@ -1004,10 +1029,12 @@ app.post('/api/appointments', authenticatedUser, async (req, res) => {
     const leadId = typeof input.leadId === 'string' ? input.leadId : ''
     const linkedLead = leadId ? leads.get(leadId) : null
     if (leadId && !linkedLead) return res.status(404).json({ error: 'Lead yang dipilih tidak ditemukan. Muat ulang daftar lead.' })
+    let phone = input.phone || trustedLeadPhone(linkedLead)
+    if (linkedLead && String(linkedLead.jid || '').endsWith('@lid') && String(phone || '').replace(/\D/g, '') === String(linkedLead.jid).split('@')[0].replace(/\D/g, '')) phone = trustedLeadPhone(linkedLead)
     const appointment = cleanAppointment({
       ...input,
-      customerName: input.customerName || linkedLead?.name,
-      phone: input.phone || linkedLead?.phone
+      customerName: input.customerName || linkedLead?.customerName || linkedLead?.name,
+      phone
     })
     appointment.id = randomUUID()
     appointment.createdAt = Date.now()
@@ -1029,8 +1056,14 @@ app.put('/api/appointments/:id', authenticatedUser, async (req, res) => {
   const appointment = appointments.get(String(req.params.id || ''))
   if (!appointment) return res.status(404).json({ error: 'Jadwal survei tidak ditemukan.' })
   try {
-    Object.assign(appointment, cleanAppointment(req.body || {}, appointment))
-    const linkedLead = appointment.leadId ? leads.get(appointment.leadId) : null
+    const linkedLead = (req.body?.leadId || appointment.leadId) ? leads.get(req.body?.leadId || appointment.leadId) : null
+    const update = { ...(req.body || {}) }
+    if (linkedLead && String(linkedLead.jid || '').endsWith('@lid')) {
+      const lidDigits = String(linkedLead.jid).split('@')[0].replace(/\D/g, '')
+      const requestedPhone = String(update.phone ?? appointment.phone ?? '').replace(/\D/g, '')
+      if (requestedPhone === lidDigits) update.phone = trustedLeadPhone(linkedLead)
+    }
+    Object.assign(appointment, cleanAppointment(update, appointment))
     if (linkedLead) {
       if (appointment.status === 'completed') linkedLead.status = 'survey_completed'
       else if (appointment.status === 'cancelled' && linkedLead.status === 'survey_scheduled') linkedLead.status = 'qualified'
