@@ -232,7 +232,7 @@ app.get('/panel', async (_req, res) => {
 // Only these CRM actions may be routed to an owned secondary brand.
 app.use('/api/brand-actions/:brand', (req,res,next)=>{
   const allowed = {GET:['/inbox','/inbox/messages','/inbox/media','/whatsapp/groups','/meta-ads/balance','/meta-ads/performance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/whatsapp/send-media','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
-  if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='GET' && /^\/inbox\/media\/[a-f0-9-]+$/i.test(req.path)) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
+  if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='GET' && /^\/inbox\/media\/[a-f0-9-]+$/i.test(req.path)) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)) && !(req.method==='DELETE' && /^\/appointments\/[^/]+$/.test(req.path)))return res.sendStatus(404)
   req.mowyBrandName=req.params.brand
   const target='/api'+req.url
   // Mounted middleware restores its prefix on next(); dispatch the canonical route instead.
@@ -1042,6 +1042,31 @@ app.put('/api/appointments/:id', authenticatedUser, async (req, res) => {
     res.json({ appointment })
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Data jadwal tidak valid.' })
+  }
+})
+
+app.delete('/api/appointments/:id', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireAppointmentOwner(req, res)) return
+  const appointment = appointments.get(String(req.params.id || ''))
+  if (!appointment) return res.status(404).json({ error: 'Jadwal survei tidak ditemukan.' })
+  try {
+    appointments.delete(appointment.id)
+    const linkedLead = appointment.leadId ? leads.get(appointment.leadId) : null
+    if (linkedLead && linkedLead.status === 'survey_scheduled') {
+      const hasAnotherActiveSurvey = [...appointments.values()].some(item =>
+        item.leadId === linkedLead.id && ['scheduled', 'confirmed'].includes(item.status)
+      )
+      if (!hasAnotherActiveSurvey) {
+        linkedLead.status = 'qualified'
+        linkedLead.updatedAt = Date.now()
+        await persistLeads()
+      }
+    }
+    await persistAppointments()
+    res.json({ deleted: true, id: appointment.id })
+  } catch (error) {
+    console.error('Appointment delete failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(500).json({ error: 'Jadwal survei gagal dihapus.' })
   }
 })
 
