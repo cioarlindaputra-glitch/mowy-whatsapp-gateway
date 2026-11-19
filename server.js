@@ -854,6 +854,8 @@ function cleanAppointment(input, previous = {}) {
   const status = appointmentStatuses.has(input.status) ? input.status : previous.status || 'scheduled'
   // Field yang diisi manual dikunci agar tidak ditimpa pembaruan otomatis dari AI.
   const manualFields = new Set(Array.isArray(previous.manualFields) ? previous.manualFields : [])
+  if (typeof input.customerName === 'string' && customerName !== (previous.customerName || '')) manualFields.add('customerName')
+  if (typeof input.phone === 'string' && phone !== (previous.phone || '')) manualFields.add('phone')
   if (typeof input.scheduledAt === 'string' && new Date(parsedTime).toISOString() !== previous.scheduledAt) manualFields.add('scheduledAt')
   if (typeof input.location === 'string' && location !== previous.location) manualFields.add('location')
   if (typeof input.assignedTo === 'string' && input.assignedTo.trim() !== (previous.assignedTo || '')) manualFields.add('assignedTo')
