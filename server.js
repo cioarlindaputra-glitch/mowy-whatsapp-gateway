@@ -346,10 +346,59 @@ function persistAppointments() {
   return workspace.writes.appointments
 }
 
-async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = Date.now(), id, media }) {
+function phoneNumberFromJid(value) {
+  const match = /^(\\d{8,15})(?::\\d+)?@(?:s\\.whatsapp\\.net|c\\.us)$/i.exec(String(value || ''))
+  return match?.[1] || ''
+}
+
+function trustedStoredLeadPhone(lead) {
+  const jid = String(lead?.jid || lead?.id || '')
+  const digits = String(lead?.phone || '').replace(/\\D/g, '')
+  if (digits.length < 8 || digits.length > 15) return ''
+  if (jid.endsWith('@lid') && digits === jid.split('@')[0].replace(/\\D/g, '')) return ''
+  return digits
+}
+
+async function resolveLeadPhone(lead, socket = currentWorkspace().socket) {
+  const saved = trustedStoredLeadPhone(lead)
+  if (saved) return saved
+  const jid = String(lead?.jid || lead?.id || '')
+  if (!jid.endsWith('@lid')) return phoneNumberFromJid(jid)
+  try {
+    const mapped = await socket?.signalRepository?.lidMapping?.getPNForLID?.(jid)
+    return phoneNumberFromJid(mapped)
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'lid_phone_lookup_failed', code: error?.code || null }))
+    return ''
+  }
+}
+
+async function resolveMessagePhone(message, socket = currentWorkspace().socket) {
+  const key = message?.key || {}
+  for (const candidate of [key.remoteJidAlt, key.participantAlt, key.senderPn, key.remoteJid, key.participant]) {
+    const phone = phoneNumberFromJid(candidate)
+    if (phone) return phone
+  }
+  const lid = [key.remoteJid, key.participant].find(value => String(value || '').endsWith('@lid'))
+  if (!lid) return ''
+  try {
+    const mapped = await socket?.signalRepository?.lidMapping?.getPNForLID?.(lid)
+    return phoneNumberFromJid(mapped)
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'lid_phone_lookup_failed', code: error?.code || null }))
+    return ''
+  }
+}
+
+async function saveInboxMessage({ jid, name, phone, text, fromMe = false, timestamp = Date.now(), id, media }) {
   if (!jid || !text) return
   const chat = inboxChats.get(jid) || { jid, name: '', unread: 0, updatedAt: timestamp, messages: [] }
-  if (id && chat.messages.some(message => message.id === String(id))) return
+  const actualPhone = phoneNumberFromJid(phone) || phoneNumberFromJid(jid)
+  if (actualPhone) chat.phone = actualPhone
+  if (id && chat.messages.some(message => message.id === String(id))) {
+    if (actualPhone) { inboxChats.set(jid, chat); await persistInbox() }
+    return
+  }
   // Nama kontak hanya diambil dari pesan customer; pushName pesan keluar adalah nama akun bisnis sendiri.
   if (name && !fromMe) chat.name = String(name).slice(0, 100)
   chat.updatedAt = timestamp
@@ -364,18 +413,21 @@ async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = D
 
 function inboxSummary(chat) {
   const lastMessage = chat.messages.at(-1)
-  return { jid: chat.jid, name: chat.name || chat.jid.split('@')[0], unread: Number(chat.unread || 0), updatedAt: chat.updatedAt, lastMessage: lastMessage?.text || '' }
+  return { jid: chat.jid, phone: chat.phone || phoneNumberFromJid(chat.jid), name: chat.name || chat.jid.split('@')[0], unread: Number(chat.unread || 0), updatedAt: chat.updatedAt, lastMessage: lastMessage?.text || '' }
 }
 
-async function upsertLeadFromMessage({ jid, name, text, timestamp = Date.now(), messageId }) {
+async function upsertLeadFromMessage({ jid, name, phone, text, timestamp = Date.now(), messageId }) {
   if (!jid || !text) return
   const id = jid
   const current = leads.get(id) || {
-    id, jid, phone: jid.split('@')[0], name: '', status: 'new',
+    id, jid, phone: phoneNumberFromJid(jid), name: '', status: 'new',
     createdAt: timestamp, messageCount: 0, firstMessage: String(text).slice(0, 1000)
   }
+  const actualPhone = phoneNumberFromJid(phone) || phoneNumberFromJid(jid)
+  if (actualPhone) current.phone = actualPhone
+  else if (String(jid).endsWith('@lid') && String(current.phone || '').replace(/\\D/g, '') === String(jid).split('@')[0].replace(/\\D/g, '')) current.phone = ''
 
-  if (messageId && current.lastMessageId === messageId) return
+  if (messageId && current.lastMessageId === messageId) { await persistLeads(); return }
   if (name) current.name = String(name).slice(0, 100)
   current.lastMessage = String(text).slice(0, 1000)
   if (messageId) current.lastMessageId = String(messageId).slice(0, 160)
@@ -396,7 +448,7 @@ async function backfillLeadsFromInbox() {
     const last = source.at(-1)
     if (!last) continue
     leads.set(chat.jid, {
-      id: chat.jid, jid: chat.jid, phone: chat.jid.split('@')[0], name: chat.name || '',
+      id: chat.jid, jid: chat.jid, phone: chat.phone || phoneNumberFromJid(chat.jid), name: chat.name || '',
       status: 'new', createdAt: source[0].timestamp || chat.updatedAt,
       updatedAt: last.timestamp || chat.updatedAt, messageCount: inbound.length, lastMessageId: last.id,
       firstMessage: source[0].text, lastMessage: last.text
@@ -880,15 +932,23 @@ app.get('/api/inbox', authenticatedUser, (req, res) => {
   res.json({ chats: [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)).map(inboxSummary) })
 })
 
-app.get('/api/leads', authenticatedUser, (req, res) => {
+app.get('/api/leads', authenticatedUser, async (req, res) => {
   if (!requireLeadOwner(req, res)) return
-  backfillLeadsFromInbox().then(() => {
-    const list = [...leads.values()].map(lead => { if (typeof lead.aiReply !== 'boolean') lead.aiReply = true; return lead.scoreRows ? lead : applyLeadScore(lead) }).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
-    res.json({ leads: list, scoring: { enabled: leadScoringEnabled, variables: leadScoringVariables.map(({ key, label, weight, media }) => ({ key, label, weight, media })), stages: { hot: 70, warm: 40 } } })
-  }).catch(error => {
+  try {
+    await backfillLeadsFromInbox()
+    let changed = false
+    for (const lead of leads.values()) {
+      const resolved = await resolveLeadPhone(lead)
+      if (String(lead.phone || '') !== resolved) { lead.phone = resolved; changed = true }
+      if (typeof lead.aiReply !== 'boolean') lead.aiReply = true
+    }
+    if (changed) await persistLeads()
+    const list = [...leads.values()].map(lead => lead.scoreRows ? lead : applyLeadScore(lead)).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+    res.set('Cache-Control', 'no-store').json({ leads: list, scoring: { enabled: leadScoringEnabled, variables: leadScoringVariables.map(({ key, label, weight, media }) => ({ key, label, weight, media })), stages: { hot: 70, warm: 40 } } })
+  } catch (error) {
     console.error('Lead backfill failed:', error instanceof Error ? error.message : 'unknown')
     res.status(500).json({ error: 'Data lead gagal dimuat dari inbox.' })
-  })
+  }
 })
 
 app.get('/api/leads/scoring', authenticatedUser, (req, res) => {
@@ -1745,6 +1805,7 @@ async function handleIncomingMessage(message) {
   const photo=inboundImage(message), video=inboundVideo(message)
   const workspace = currentWorkspace()
   const jid = message.key.remoteJid
+  const phone = await resolveMessagePhone(message, workspace.socket)
   const caption = extractText(message)
   if ((!caption && !photo && !video) || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') {
     console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: !caption && !photo && !video ? 'no_text_or_media' : workspace.connectionState !== 'connected' ? `state_${workspace.connectionState}` : 'no_socket' }))
@@ -1754,8 +1815,8 @@ async function handleIncomingMessage(message) {
   const text = caption || (photo ? '[Foto pelanggan]' : video ? (savedVideo ? '[Video pelanggan]' : '[Video pelanggan — gagal disimpan; format atau ukuran tidak didukung]') : '')
   const rawTimestamp = message.messageTimestamp?.toNumber?.() ?? Number(message.messageTimestamp || Math.floor(Date.now() / 1000))
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
-  await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id, ...(savedVideo ? { media: savedVideo } : {}) })
-  await upsertLeadFromMessage({ jid, name: message.pushName, text, timestamp, messageId: message.key.id })
+  await saveInboxMessage({ jid, phone, name: message.pushName, text, timestamp, id: message.key.id, ...(savedVideo ? { media: savedVideo } : {}) })
+  await upsertLeadFromMessage({ jid, phone, name: message.pushName, text, timestamp, messageId: message.key.id })
   const content=message.message?.ephemeralMessage?.message||message.message||{}
   const adsReferral=Object.values(content).some(part=>{const ad=part?.contextInfo?.externalAdReply;return !!ad&&(!!ad.ctwaClid||String(ad.sourceType||'').toLowerCase()==='ad')})
   const adLead=leads.get(jid)
