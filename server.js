@@ -36,7 +36,7 @@ function workspacePaths(userId) {
   const isLegacyOwner = Boolean(legacyOwnerUserId && legacyOwnerUserId === userId)
   const dataDir = isLegacyOwner ? baseDataDir : path.join(workspaceRoot, safeId)
   const sessionDir = isLegacyOwner ? baseSessionDir : path.join(dataDir, 'whatsapp-session')
-  return { dataDir, sessionDir, knowledge: path.join(dataDir, 'mowy-knowledge-documents.json'), inbox: path.join(dataDir, 'mowy-inbox.json'), leads: path.join(dataDir, 'mowy-leads.json'), appointments: path.join(dataDir, 'mowy-appointments.json'), leadLayouts: path.join(dataDir, 'mowy-lead-layouts'), mediaDir: path.join(dataDir, 'mowy-business-media'), media: path.join(dataDir, 'mowy-business-media.json') }
+  return { dataDir, sessionDir, knowledge: path.join(dataDir, 'mowy-knowledge-documents.json'), inbox: path.join(dataDir, 'mowy-inbox.json'), leads: path.join(dataDir, 'mowy-leads.json'), appointments: path.join(dataDir, 'mowy-appointments.json'), leadLayouts: path.join(dataDir, 'mowy-lead-layouts'), clientMediaDir: path.join(dataDir, 'mowy-client-media'), mediaDir: path.join(dataDir, 'mowy-business-media'), media: path.join(dataDir, 'mowy-business-media.json') }
 }
 async function loadWorkspace(userId) {
   if (!workspaceStates.has(userId)) workspaceStates.set(userId, (async () => {
@@ -231,8 +231,8 @@ app.get('/panel', async (_req, res) => {
 
 // Only these CRM actions may be routed to an owned secondary brand.
 app.use('/api/brand-actions/:brand', (req,res,next)=>{
-  const allowed = {GET:['/inbox','/inbox/messages','/whatsapp/groups','/meta-ads/balance','/meta-ads/performance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
-  if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
+  const allowed = {GET:['/inbox','/inbox/messages','/inbox/media','/whatsapp/groups','/meta-ads/balance','/meta-ads/performance','/meta-ads/connection','/appointments'],POST:['/inbox/reply','/whatsapp/send-document','/whatsapp/send-media','/meta-ads/connection','/meta-ads/disconnect','/meta-ads/login','/meta-ads/accounts','/meta-ads/select']}
+  if(!(allowed[req.method]||[]).includes(req.path) && !(req.method==='GET' && /^\/inbox\/media\/[a-f0-9-]+$/i.test(req.path)) && !(req.method==='PUT' && /^\/leads\/[^/]+$/.test(req.path)))return res.sendStatus(404)
   req.mowyBrandName=req.params.brand
   const target='/api'+req.url
   // Mounted middleware restores its prefix on next(); dispatch the canonical route instead.
@@ -346,7 +346,7 @@ function persistAppointments() {
   return workspace.writes.appointments
 }
 
-async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = Date.now(), id }) {
+async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = Date.now(), id, media }) {
   if (!jid || !text) return
   const chat = inboxChats.get(jid) || { jid, name: '', unread: 0, updatedAt: timestamp, messages: [] }
   if (id && chat.messages.some(message => message.id === String(id))) return
@@ -354,7 +354,7 @@ async function saveInboxMessage({ jid, name, text, fromMe = false, timestamp = D
   if (name && !fromMe) chat.name = String(name).slice(0, 100)
   chat.updatedAt = timestamp
   if (!fromMe) chat.unread = Math.min(999, Number(chat.unread || 0) + 1)
-  chat.messages.push({ id: String(id || `${timestamp}-${chat.messages.length}`).slice(0, 120), text: String(text).slice(0, 2000), fromMe: Boolean(fromMe), timestamp })
+  chat.messages.push({ id: String(id || `${timestamp}-${chat.messages.length}`).slice(0, 120), text: String(text).slice(0, 2000), fromMe: Boolean(fromMe), timestamp, ...(media ? { media } : {}) })
   if (chat.messages.length > 100) chat.messages.splice(0, chat.messages.length - 100)
   inboxChats.set(jid, chat)
   const ordered = [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
@@ -1050,6 +1050,25 @@ app.get('/api/inbox/messages', authenticatedUser, (req, res) => {
   res.json({ messages: chat.messages })
 })
 
+app.get('/api/inbox/media/:id', authenticatedUser, async (req, res) => {
+  if (!requireInboxOwner(req, res)) return
+  const id = String(req.params.id || '')
+  if (!/^[a-f0-9-]{36}$/i.test(id)) return res.status(404).json({ error: 'Video tidak ditemukan.' })
+  const item = [...inboxChats.values()].flatMap(chat => chat.messages || []).find(message => message.media?.id === id)
+  const extensions = { 'video/mp4': '.mp4', 'video/3gpp': '.3gp' }
+  if (!item?.media || !extensions[item.media.mimeType]) return res.status(404).json({ error: 'Video tidak ditemukan di Inbox.' })
+  try {
+    const file = await fs.readFile(path.join(currentWorkspace().files.clientMediaDir, id + extensions[item.media.mimeType]))
+    if (file.length > 64 * 1024 * 1024) return res.status(413).json({ error: 'Ukuran video melewati batas.' })
+    res.set({ 'Content-Type': item.media.mimeType, 'Content-Length': file.length, 'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(item.media.name || 'Video WhatsApp')}`, 'Cache-Control': 'private, no-store' })
+    return res.send(file)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return res.status(404).json({ error: 'File video tidak ada di penyimpanan persisten.' })
+    console.error('Incoming video read failed:', error instanceof Error ? error.message : 'unknown')
+    return res.status(500).json({ error: 'Video gagal dibuka.' })
+  }
+})
+
 app.post('/api/inbox/read', authenticatedUser, async (req, res) => {
   if (!requireInboxOwner(req, res)) return
   const chat = inboxChats.get(String(req.body?.jid || ''))
@@ -1113,6 +1132,33 @@ app.post('/api/whatsapp/send-document', authenticatedUser, async (req, res) => {
   } catch (error) {
     console.error('WhatsApp group document send failed:', error instanceof Error ? error.message : 'unknown')
     res.status(502).json({ error: 'Resume PDF gagal dikirim ke grup WhatsApp.' })
+  }
+})
+
+app.post('/api/whatsapp/send-media', authenticatedUser, async (req, res) => {
+  if (!requireOwner(req, res) || !requireInboxOwner(req, res)) return
+  const jid = String(req.body?.jid || '')
+  const mediaId = String(req.body?.mediaId || '')
+  const caption = typeof req.body?.caption === 'string' ? req.body.caption.trim().slice(0, 500) : ''
+  if (!jid.endsWith('@g.us')) return res.status(400).json({ error: 'Pilih grup WhatsApp tujuan.' })
+  if (!/^[a-f0-9-]{36}$/i.test(mediaId)) return res.status(400).json({ error: 'Video tidak valid.' })
+  const item = [...inboxChats.values()].flatMap(chat => chat.messages || []).find(message => message.media?.id === mediaId)
+  const extensions = { 'video/mp4': '.mp4', 'video/3gpp': '.3gp' }
+  if (!item?.media || !extensions[item.media.mimeType]) return res.status(404).json({ error: 'Video tidak ditemukan di Inbox.' })
+  const socket = currentWorkspace().socket
+  if (!socket || currentWorkspace().connectionState !== 'connected') return res.status(409).json({ error: 'WhatsApp sedang tidak tersambung.' })
+  try {
+    const groups = await socket.groupFetchAllParticipating()
+    const group = groups?.[jid]
+    if (!group) return res.status(404).json({ error: 'Grup tujuan tidak ditemukan pada WhatsApp yang tersambung.' })
+    const file = await fs.readFile(path.join(currentWorkspace().files.clientMediaDir, mediaId + extensions[item.media.mimeType]))
+    if (!file.length || file.length > 64 * 1024 * 1024) return res.status(413).json({ error: 'Video kosong atau ukurannya melebihi 64 MB.' })
+    const sent = await socket.sendMessage(jid, { video: file, mimetype: item.media.mimeType, caption })
+    await saveInboxMessage({ jid, name: group.subject || 'Grup WhatsApp', text: `[Video pelanggan diteruskan] ${item.media.name}`, fromMe: true, timestamp: Date.now(), id: sent?.key?.id, media: item.media })
+    res.json({ sent: true, jid, name: group.subject || 'Grup WhatsApp', fileName: item.media.name })
+  } catch (error) {
+    console.error('WhatsApp group video send failed:', error instanceof Error ? error.message : 'unknown')
+    res.status(502).json({ error: 'Video gagal dikirim ke grup WhatsApp.' })
   }
 })
 
@@ -1602,18 +1648,47 @@ async function sendBusinessMedia(socket, jid, file) {
   return true
 }
 
+function inboundVideo(message){const m=message.message?.ephemeralMessage?.message||message.message;return m?.videoMessage}
+const maxIncomingVideoBytes = 64 * 1024 * 1024
+async function saveIncomingVideo(message, video) {
+  const mimeType = String(video.mimetype || '').toLowerCase().split(';')[0]
+  const extension = { 'video/mp4': '.mp4', 'video/3gpp': '.3gp' }[mimeType]
+  const expected = Number(video.fileLength || 0)
+  if (!extension || expected > maxIncomingVideoBytes) return null
+  try {
+    const stream = await downloadContentFromMessage(video, 'video')
+    const chunks = []
+    let size = 0
+    for await (const chunk of stream) {
+      size += chunk.length
+      if (size > maxIncomingVideoBytes) throw new Error('video_limit')
+      chunks.push(chunk)
+    }
+    if (!size) return null
+    const id = randomUUID()
+    await fs.mkdir(currentWorkspace().files.clientMediaDir, { recursive: true })
+    await fs.writeFile(path.join(currentWorkspace().files.clientMediaDir, id + extension), Buffer.concat(chunks), { mode: 0o600, flag: 'wx' })
+    return { id, name: `Video WhatsApp ${new Date().toLocaleString('id-ID')}${extension}`, mimeType, size, source: 'whatsapp_customer' }
+  } catch (error) {
+    console.warn('Incoming customer video could not be saved:', error.name || 'unknown')
+    return null
+  }
+}
+
 async function handleIncomingMessage(message) {
-  const photo=inboundImage(message)
-  const text = extractText(message) || (photo?'[Foto pelanggan]':'')
+  const photo=inboundImage(message), video=inboundVideo(message)
   const workspace = currentWorkspace()
   const jid = message.key.remoteJid
-  if (!text || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') {
-    console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: !text ? 'no_text' : workspace.connectionState !== 'connected' ? `state_${workspace.connectionState}` : 'no_socket' }))
+  const caption = extractText(message)
+  if ((!caption && !photo && !video) || !workspace.userId || !workspace.socket || workspace.connectionState !== 'connected') {
+    console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: !caption && !photo && !video ? 'no_text_or_media' : workspace.connectionState !== 'connected' ? `state_${workspace.connectionState}` : 'no_socket' }))
     return
   }
+  const savedVideo = video ? await saveIncomingVideo(message, video) : null
+  const text = caption || (photo ? '[Foto pelanggan]' : video ? (savedVideo ? '[Video pelanggan]' : '[Video pelanggan — gagal disimpan; format atau ukuran tidak didukung]') : '')
   const rawTimestamp = message.messageTimestamp?.toNumber?.() ?? Number(message.messageTimestamp || Math.floor(Date.now() / 1000))
   const timestamp = Number.isFinite(rawTimestamp) ? rawTimestamp * (rawTimestamp < 100000000000 ? 1000 : 1) : Date.now()
-  await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id })
+  await saveInboxMessage({ jid, name: message.pushName, text, timestamp, id: message.key.id, ...(savedVideo ? { media: savedVideo } : {}) })
   await upsertLeadFromMessage({ jid, name: message.pushName, text, timestamp, messageId: message.key.id })
   const content=message.message?.ephemeralMessage?.message||message.message||{}
   const adsReferral=Object.values(content).some(part=>{const ad=part?.contextInfo?.externalAdReply;return !!ad&&(!!ad.ctwaClid||String(ad.sourceType||'').toLowerCase()==='ad')})
