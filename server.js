@@ -1004,10 +1004,16 @@ app.get('/api/appointments', authenticatedUser, async (req, res) => {
   if (!requireAppointmentOwner(req, res)) return
   let normalized = false
   for (const appointment of appointments.values()) {
-    const lead = appointment.leadId ? leads.get(appointment.leadId) : null
-    if (!lead || !String(lead.jid || '').endsWith('@lid')) continue
-    const lidDigits = String(lead.jid).split('@')[0].replace(/\D/g, '')
     const appointmentDigits = String(appointment.phone || '').replace(/\D/g, '')
+    const lead = (appointment.leadId ? leads.get(appointment.leadId) : null) || [...leads.values()].find(candidate => {
+      const jid = String(candidate.jid || candidate.id || '')
+      const local = jid.endsWith('@lid') ? jid.split('@')[0].replace(/\D/g, '') : ''
+      const customerDigits = String(appointment.customerName || '').replace(/\D/g, '')
+      return local && appointmentDigits === local && (customerDigits === local || /Dibuat otomatis dari chat WhatsApp/i.test(appointment.notes || ''))
+    })
+    if (!lead || !String(lead.jid || '').endsWith('@lid')) continue
+    if (!appointment.leadId) { appointment.leadId = lead.id; normalized = true }
+    const lidDigits = String(lead.jid).split('@')[0].replace(/\D/g, '')
     if (appointmentDigits === lidDigits || !appointment.phone) {
       const actualPhone = trustedLeadPhone(lead)
       if (appointment.phone !== actualPhone) { appointment.phone = actualPhone; normalized = true }
