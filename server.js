@@ -347,15 +347,15 @@ function persistAppointments() {
 }
 
 function phoneNumberFromJid(value) {
-  const match = /^(\\d{8,15})(?::\\d+)?@(?:s\\.whatsapp\\.net|c\\.us)$/i.exec(String(value || ''))
+  const match = /^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/i.exec(String(value || ''))
   return match?.[1] || ''
 }
 
 function trustedStoredLeadPhone(lead) {
   const jid = String(lead?.jid || lead?.id || '')
-  const digits = String(lead?.phone || '').replace(/\\D/g, '')
+  const digits = String(lead?.phone || '').replace(/\D/g, '')
   if (digits.length < 8 || digits.length > 15) return ''
-  if (jid.endsWith('@lid') && digits === jid.split('@')[0].replace(/\\D/g, '')) return ''
+  if (jid.endsWith('@lid') && digits === jid.split('@')[0].replace(/\D/g, '')) return ''
   return digits
 }
 
@@ -425,7 +425,7 @@ async function upsertLeadFromMessage({ jid, name, phone, text, timestamp = Date.
   }
   const actualPhone = phoneNumberFromJid(phone) || phoneNumberFromJid(jid)
   if (actualPhone) current.phone = actualPhone
-  else if (String(jid).endsWith('@lid') && String(current.phone || '').replace(/\\D/g, '') === String(jid).split('@')[0].replace(/\\D/g, '')) current.phone = ''
+  else if (String(jid).endsWith('@lid') && String(current.phone || '').replace(/\D/g, '') === String(jid).split('@')[0].replace(/\D/g, '')) current.phone = ''
 
   if (messageId && current.lastMessageId === messageId) { await persistLeads(); return }
   if (name) current.name = String(name).slice(0, 100)
