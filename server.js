@@ -421,9 +421,10 @@ async function upsertLeadFromMessage({ jid, name, phone, text, timestamp = Date.
   const id = jid
   const current = leads.get(id) || {
     id, jid, phone: phoneNumberFromJid(jid), name: '', status: 'new',
-    createdAt: timestamp, messageCount: 0, firstMessage: String(text).slice(0, 1000)
+    createdAt: timestamp, firstResponseAt: timestamp, messageCount: 0, firstMessage: String(text).slice(0, 1000)
   }
   const actualPhone = phoneNumberFromJid(phone) || phoneNumberFromJid(jid)
+  if (!Number(current.firstResponseAt)) current.firstResponseAt = timestamp
   if (actualPhone) current.phone = actualPhone
   else if (String(jid).endsWith('@lid') && String(current.phone || '').replace(/\D/g, '') === String(jid).split('@')[0].replace(/\D/g, '')) current.phone = ''
 
@@ -440,16 +441,23 @@ async function upsertLeadFromMessage({ jid, name, phone, text, timestamp = Date.
 async function backfillLeadsFromInbox() {
   let changed = false
   for (const chat of inboxChats.values()) {
-    if (leads.has(chat.jid)) continue
-    // Setiap percakapan di inbox adalah kontak prospek, walaupun pesan customer belum tercatat
-    // (mis. chat dimulai dari nomor bisnis atau pesan masuk sebelum gateway tersambung).
     const inbound = chat.messages.filter(message => !message.fromMe && message.text)
+    const existing = leads.get(chat.jid)
+    if (existing) {
+      if (inbound.length) {
+        if (!Number(existing.firstResponseAt)) { existing.firstResponseAt = inbound[0].timestamp || chat.updatedAt; changed = true }
+        if (Number(existing.messageCount || 0) < inbound.length) { existing.messageCount = inbound.length; changed = true }
+      }
+      continue
+    }
+    // Catat waktu respons pertama agar laporan CRM memakai tanggal pelanggan membalas.
     const source = inbound.length ? inbound : chat.messages.filter(message => message.text)
     const last = source.at(-1)
     if (!last) continue
     leads.set(chat.jid, {
       id: chat.jid, jid: chat.jid, phone: chat.phone || phoneNumberFromJid(chat.jid), name: chat.name || '',
       status: 'new', createdAt: source[0].timestamp || chat.updatedAt,
+      ...(inbound.length ? { firstResponseAt: inbound[0].timestamp || chat.updatedAt } : {}),
       updatedAt: last.timestamp || chat.updatedAt, messageCount: inbound.length, lastMessageId: last.id,
       firstMessage: source[0].text, lastMessage: last.text
     })
