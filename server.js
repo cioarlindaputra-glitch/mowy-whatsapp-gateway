@@ -64,6 +64,56 @@ const appointments = proxyForMap('appointments')
 const businessMedia = proxyForMap('businessMedia')
 const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
+const requestBuckets = new Map()
+function workspaceRateLimit(bucket, limit, windowMs) {
+  return (req, res, next) => {
+    const workspaceId = req.mowyWorkspace?.userId || req.mowyUser?.id
+    if (!workspaceId) return res.status(401).json({ error: 'Sesi login Mowy diperlukan.' })
+    const key = `${workspaceId}:${bucket}`
+    const now = Date.now()
+    let state = requestBuckets.get(key)
+    if (!state || state.resetAt <= now) state = { count: 0, resetAt: now + windowMs }
+    state.count += 1
+    requestBuckets.set(key, state)
+    if (requestBuckets.size > 20000) for (const [k, value] of requestBuckets) if (value.resetAt <= now) requestBuckets.delete(k)
+    if (state.count > limit) {
+      res.set('Retry-After', String(Math.max(1, Math.ceil((state.resetAt - now) / 1000))))
+      return res.status(429).json({ error: 'Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.' })
+    }
+    next()
+  }
+}
+
+const metaResponseCache = new Map()
+async function cachedMetaResponse(key, ttlMs, load) {
+  const now = Date.now(), existing = metaResponseCache.get(key)
+  if (existing && existing.expiresAt > now) return existing.promise
+  const entry = { expiresAt: now + ttlMs, promise: null }
+  entry.promise = Promise.resolve().then(load).then(value => {
+    entry.expiresAt = Date.now() + ttlMs
+    entry.promise = Promise.resolve(value)
+    return value
+  }).catch(error => {
+    if (metaResponseCache.get(key) === entry) metaResponseCache.delete(key)
+    throw error
+  })
+  metaResponseCache.set(key, entry)
+  if (metaResponseCache.size > 2000) for (const [k, value] of metaResponseCache) if (value.expiresAt <= now) metaResponseCache.delete(k)
+  return entry.promise
+}
+function clearMetaCache(workspaceId) {
+  const prefix = `${workspaceId}:`
+  for (const key of metaResponseCache.keys()) if (key.startsWith(prefix)) metaResponseCache.delete(key)
+}
+function metaErrorResponse(res, event, error, fallback) {
+  const code = Number(error?.metaError?.code || error?.error?.code || 0) || null
+  const subcode = Number(error?.metaError?.error_subcode || error?.error?.error_subcode || 0) || null
+  const status = Number(error?.statusCode || error?.status || 0) || null
+  console.warn(JSON.stringify({ event, code, subcode, status }))
+  if (code === 190 || [463, 467, 460].includes(subcode)) return res.status(401).json({ error: 'Token Meta tidak valid atau kedaluwarsa. Hubungkan ulang akun Meta di Data Client.', code: 'meta_token_invalid' })
+  return res.status(502).json({ error: fallback, code: 'meta_request_failed' })
+}
+
 app.disable('x-powered-by')
 app.use((req, res, next) => {
   const origin = req.headers.origin
@@ -693,6 +743,27 @@ function persistMedia() {
 
 }
 
+const workspaceMediaQuotaBytes = 500 * 1024 * 1024
+function validMediaSignature(bytes, mimeType) {
+  if (mimeType === 'application/pdf') return bytes.subarray(0,16).includes(Buffer.from('%PDF-'))
+  if (mimeType === 'image/jpeg') return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+  if (mimeType === 'image/png') return bytes.subarray(0,8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))
+  if (mimeType === 'image/webp') return bytes.subarray(0,4).toString() === 'RIFF' && bytes.subarray(8,12).toString() === 'WEBP'
+  if (mimeType === 'video/mp4') return bytes.indexOf(Buffer.from('ftyp'),4) >= 4 && bytes.indexOf(Buffer.from('ftyp'),4) < 32
+  if (mimeType === 'video/webm') return bytes.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]))
+  if (mimeType.endsWith('wordprocessingml.document') || mimeType.endsWith('spreadsheetml.sheet')) return bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
+  return false
+}
+async function workspaceMediaBytes(workspace) {
+  const names=await fs.readdir(workspace.files.mediaDir).catch(error=>error.code==='ENOENT'?[]:Promise.reject(error))
+  let total=0
+  for(const name of names) {
+    if(!/^[a-f0-9-]{36}\\.(pdf|jpg|png|webp|mp4|webm|docx|xlsx)$/i.test(name))continue
+    try{total+=(await fs.stat(path.join(workspace.files.mediaDir,name))).size}catch{}
+  }
+  return total
+}
+
 const mediaTypes = new Map([
   ['application/pdf', '.pdf'], ['image/jpeg', '.jpg'], ['image/png', '.png'], ['image/webp', '.webp'],
   ['video/mp4', '.mp4'], ['video/webm', '.webm'], ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'],
@@ -784,25 +855,35 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
   const extension = mediaTypes.get(mimeType)
   if (!extension) return reject(415, `Format file belum didukung (${mimeType || 'tipe tidak dikirim'}). Gunakan PDF, gambar, video MP4/WEBM, DOCX, atau XLSX.`)
   if (!mediaCategories.has(category) || !name) return reject(400, `Isi kategori dan nama file terlebih dahulu. (kategori diterima: ${category || '-'})`)
+  const workspace=currentWorkspace()
+  const usedBytes=await workspaceMediaBytes(workspace)
+  if(usedBytes>=workspaceMediaQuotaBytes)return reject(413,'Batas penyimpanan media workspace 500 MB sudah tercapai. Hapus file lama sebelum mengunggah lagi.')
+  const allowedBytes=Math.min(maxMediaBytes,workspaceMediaQuotaBytes-usedBytes)
   const id = randomUUID()
   const storageName = `${id}${extension}`
   const target = path.join(currentWorkspace().files.mediaDir, storageName)
   let received = 0
   const sizeLimit = new Transform({ transform(chunk, _encoding, callback) {
     received += chunk.length
-    if (received > maxMediaBytes) return callback(Object.assign(new Error('Ukuran file maksimal 200 MB.'), { statusCode: 413 }))
+    if (received > allowedBytes) return callback(Object.assign(new Error('Ukuran file melebihi sisa kuota workspace.'), { statusCode: 413 }))
     callback(null, chunk)
   } })
   try {
     await fs.mkdir(currentWorkspace().files.mediaDir, { recursive: true })
     if (data) {
       if (!data.length) return reject(400, 'File unggahan kosong.')
-      if (data.length > maxMediaBytes) return reject(413, 'Ukuran file maksimal 200 MB.')
+      if (data.length > allowedBytes) return reject(413, 'Ukuran file melebihi sisa kuota workspace.')
       await fs.writeFile(target, data, { mode: 0o600, flag: 'wx' })
       received = data.length
     } else {
       await pipeline(req, sizeLimit, createWriteStream(target, { flags: 'wx', mode: 0o600 }))
     }
+    if(received>allowedBytes)throw Object.assign(new Error('Batas penyimpanan media workspace sudah tercapai.'),{statusCode:413})
+    const handle=await fs.open(target,'r')
+    const signature=Buffer.alloc(16)
+    let bytesRead
+    try{({bytesRead}=await handle.read(signature,0,signature.length,0))}finally{await handle.close()}
+    if(bytesRead<4||!validMediaSignature(signature.subarray(0,bytesRead),mimeType))throw Object.assign(new Error('Isi file tidak sesuai dengan tipe yang dipilih.'),{statusCode:415})
     const file = { id, name, category, mimeType, size: received, storageName, uploadedAt: Date.now() }
     businessMedia.set(id, file)
     await persistMedia()
@@ -816,7 +897,9 @@ app.post('/api/media/upload', authenticatedUser, async (req, res) => {
     return res.status(201).json({ file, registered: register })
   } catch (error) {
     await fs.rm(target, { force: true }).catch(() => {})
-    if (error?.statusCode === 413) return reject(413, 'Ukuran file maksimal 200 MB.')
+    businessMedia.delete(id)
+    if (error?.statusCode === 413) return reject(413, error.message || 'Ukuran file maksimal 200 MB.')
+    if (error?.statusCode === 415) return reject(415, error.message)
     console.error('Business media upload failed:', error instanceof Error ? error.message : 'unknown')
     return reject(500, `File gagal disimpan di server (${error?.code || 'unknown'}). Periksa disk persisten dan izin folder data.`)
   }
@@ -1301,7 +1384,7 @@ const metaCallback='https://mowy-whatsapp-gateway.onrender.com/api/meta-ads/call
 const metaAppOrigin='https://mowy-cs-ai.jellyjelley17.chatgpt.site'
 const metaNonce=()=>randomBytes(32).toString('hex')
 setInterval(()=>{for(const [key,x] of metaPending)if(x.until<Date.now())metaPending.delete(key)},60000).unref()
-app.post('/api/meta-ads/login',authenticatedUser,(req,res)=>{
+app.post('/api/meta-ads/login',authenticatedUser,workspaceRateLimit('meta-oauth',10,60000),(req,res)=>{
  const appId=process.env.META_APP_ID,config=process.env.META_LOGIN_CONFIG_ID
  if(!appId||!process.env.META_APP_SECRET||!config)return res.status(503).json({error:'Login Meta belum diaktifkan oleh admin Mowy. Untuk melihat data sekarang, buka Meta Ads Manager.'})
  const state=metaNonce(),ws=req.mowyWorkspace.userId
@@ -1318,7 +1401,7 @@ app.get('/api/meta-ads/callback',async(req,res)=>{
  const proof=metaNonce();metaPending.set(proof,{...item,token:d.access_token});res.type('html').send('<p>Kembali ke Mowy untuk memilih akun iklan. Jika jendela ini tetap terbuka, tutup lalu ulangi login.</p><script>if(window.opener){window.opener.postMessage({kind:"mowy-meta",proof:'+JSON.stringify(proof)+'},'+JSON.stringify(metaAppOrigin)+');window.close()}</script>')
  }catch{res.status(502).send('Meta belum menyelesaikan login. Kembali ke Mowy dan coba lagi.')}
 })
-for(const action of ['accounts','select'])app.post('/api/meta-ads/'+action,authenticatedUser,async(req,res)=>{
+for(const action of ['accounts','select'])app.post('/api/meta-ads/'+action,authenticatedUser,workspaceRateLimit('meta-oauth',10,60000),async(req,res)=>{
  const key=String(req.body?.proof||''),item=metaPending.get(key),ws=req.mowyWorkspace
  if(!item?.token||item.ws!==ws.userId||item.until<Date.now())return res.status(403).json({error:'Sesi login berakhir. Masuk lagi dengan Facebook.'})
  try{if(action==='accounts'){const list=[];let after='';for(let n=0;n<20;n++){const url=new URL('https://graph.facebook.com/v27.0/me/adaccounts');url.search=new URLSearchParams({fields:'account_id,name',limit:'100',...(after?{after}:{})});const r=await fetch(url,{headers:{Authorization:'Bearer '+item.token},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||!Array.isArray(d.data))throw Error();list.push(...d.data.map(x=>({id:String(x.account_id),name:String(x.name)})));after=d.paging?.next&&d.paging?.cursors?.after;if(!after)break}item.accounts=list;return res.set('Cache-Control','no-store').json({accounts:list})}
@@ -1336,49 +1419,65 @@ async function metaConfig(req){
 }
 async function writeMeta(ws,row){await fs.mkdir(ws.files.dataDir,{recursive:true});const tmp=metaFile(ws)+'.'+randomUUID();await fs.writeFile(tmp,JSON.stringify(row),{flag:'wx',mode:0o600});await fs.rename(tmp,metaFile(ws))}
 app.get('/api/meta-ads/connection',authenticatedUser,async(req,res)=>{try{const c=await metaConfig(req);res.set('Cache-Control','no-store').json({connected:!!(c.accountId&&c.accessToken),accountId:c.accountId||'',name:c.name||''})}catch{res.status(503).json({error:'Pengaturan Meta belum bisa dibaca.'})}})
-app.post('/api/meta-ads/connection',authenticatedUser,async(req,res)=>{const accountId=String(req.body?.accountId||'').trim().replace(/^act_/,''),token=String(req.body?.token||'').trim();if(!/^\d{1,25}$/.test(accountId)||!token||token.length>6000)return res.status(400).json({error:'Periksa ID akun iklan dan token akses.'});try{
+app.post('/api/meta-ads/connection',authenticatedUser,workspaceRateLimit('meta-connect',10,60000),async(req,res)=>{const accountId=String(req.body?.accountId||'').trim().replace(/^act_/,''),token=String(req.body?.token||'').trim();if(!/^\d{1,25}$/.test(accountId)||!token||token.length>6000)return res.status(400).json({error:'Periksa ID akun iklan dan token akses.'});try{
  const r=await fetch('https://graph.facebook.com/v27.0/act_'+accountId+'?fields=name,account_id,amount_spent,currency',{headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||String(d.account_id)!==accountId)return res.status(422).json({error:'Meta tidak memberi akses ke akun ini. Periksa ID akun, masa berlaku token, dan izin ads_read.'})
- const ws=req.mowyWorkspace,iv=randomBytes(12),c=createCipheriv('aes-256-gcm',metaKey(ws),iv),secret=Buffer.concat([c.update(token,'utf8'),c.final()]);await writeMeta(ws,{accountId,name:d.name,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),secret:secret.toString('base64')});res.json({connected:true,name:d.name,accountId})
+ const ws=req.mowyWorkspace,iv=randomBytes(12),c=createCipheriv('aes-256-gcm',metaKey(ws),iv),secret=Buffer.concat([c.update(token,'utf8'),c.final()]);await writeMeta(ws,{accountId,name:d.name,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),secret:secret.toString('base64')});clearMetaCache(ws.userId);res.json({connected:true,name:d.name,accountId})
  }catch{res.status(503).json({error:'Koneksi belum tersimpan. Coba lagi.'})}})
-app.post('/api/meta-ads/disconnect',authenticatedUser,async(req,res)=>{try{await writeMeta(req.mowyWorkspace,{disabled:true});res.json({connected:false})}catch{res.status(503).json({error:'Koneksi gagal dilepas.'})}})
-app.get('/api/meta-ads/performance',authenticatedUser,async(req,res)=>{
- const period=req.query.period||'this_month',since=req.query.since,until=req.query.until;const validDate=x=>typeof x==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&new Date(x).toISOString().slice(0,10)===x;if(period==='custom'&&(!validDate(since)||!validDate(until)||since>until))return res.status(400).json({error:'Rentang tanggal tidak valid.'});if(!['custom','today','last_7d','this_month','last_month'].includes(period))return res.status(400).json({error:'Periode tidak valid.'})
- try{const {accountId,accessToken}=await metaConfig(req);if(!accountId||!accessToken)return res.status(409).json({error:'Hubungkan akun Meta Ads brand ini di Data Bisnis.'})
- const url=new URL('https://graph.facebook.com/v27.0/act_'+accountId+'/insights');url.search=new URLSearchParams({level:'account',...(period==='custom'?{time_range:JSON.stringify({since,until})}:{date_preset:period}),fields:'account_name,account_currency,date_start,date_stop,spend,actions,impressions,clicks,ctr,cpc,cpm'})
- const r=await fetch(url,{headers:{Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)}),d=await r.json();if(!r.ok||!Array.isArray(d.data))throw Error()
- const row=d.data[0]||{},actions=row.actions||[],count=t=>Number(actions.find(x=>x.action_type===t)?.value||0)
- const campaigns=[];let after;const insightPeriod=period==='custom'?'.time_range('+JSON.stringify({since,until})+')':'.date_preset('+period+')';
- do{const cu=new URL('https://graph.facebook.com/v27.0/act_'+accountId+'/campaigns');cu.search=new URLSearchParams({fields:'id,name,effective_status,insights'+insightPeriod+'{spend,impressions,clicks,ctr,cpc,cpm,actions}',effective_status:JSON.stringify(['ACTIVE']),limit:'100',...(after?{after}:{})});const cr=await fetch(cu,{headers:{Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)}),cd=await cr.json();if(!cr.ok||!Array.isArray(cd.data))throw Error();for(const c of cd.data){const v=c.insights?.data?.[0]||{},impressions=Number(v.impressions||0),clicks=Number(v.clicks||0),spend=Number(v.spend||0),leads=Number(v.actions?.find(a=>a.action_type==='lead')?.value||0);campaigns.push({id:c.id,name:c.name,status:c.effective_status,spend,impressions,clicks,ctr:impressions?clicks/impressions*100:null,cpc:clicks?spend/clicks:null,cpm:impressions?spend/impressions*1000:null,leads,cpl:leads?spend/leads:null})}after=cd.paging?.next?cd.paging?.cursors?.after:null}while(after);
- res.set('Cache-Control','no-store').json({spend:Number(row.spend||0),currency:row.account_currency||null,impressions:Number(row.impressions||0),clicks:Number(row.clicks||0),ctr:Number(row.impressions)>0?Number(row.clicks||0)/Number(row.impressions)*100:null,leads:count('lead'),conversations:count('onsite_conversion.messaging_conversation_started_7d'),start:row.date_start,end:row.date_stop,account:row.account_name||accountId,campaigns,updatedAt:new Date().toISOString()})
- }catch{res.status(502).json({error:'Laporan Meta belum dapat dimuat. Periksa koneksi dan izin baca iklan.'})}
+app.post('/api/meta-ads/disconnect',authenticatedUser,workspaceRateLimit('meta-connect',10,60000),async(req,res)=>{try{await writeMeta(req.mowyWorkspace,{disabled:true});clearMetaCache(req.mowyWorkspace.userId);res.json({connected:false})}catch{res.status(503).json({error:'Koneksi gagal dilepas.'})}})
+app.get('/api/meta-ads/performance',authenticatedUser,workspaceRateLimit('meta-performance',30,60000),async(req,res)=>{
+  const period=req.query.period||'this_month',since=req.query.since,until=req.query.until
+  const validDate=x=>typeof x==='string'&&/^\\d{4}-\\d{2}-\\d{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&new Date(x).toISOString().slice(0,10)===x
+  const todayJakarta=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Jakarta'})
+  if(period==='custom'&&(!validDate(since)||!validDate(until)||since>until||until>todayJakarta||Date.parse(until)-Date.parse(since)>90*86400000))return res.status(400).json({error:'Rentang tanggal tidak valid atau melebihi 90 hari.'})
+  if(!['custom','today','last_7d','last_30d','this_month','last_month'].includes(period))return res.status(400).json({error:'Periode tidak valid.'})
+  try{
+   const {accountId,accessToken}=await metaConfig(req)
+   if(!accountId||!accessToken)return res.status(409).json({error:'Hubungkan akun Meta Ads brand ini di Data Client.'})
+   const cacheKey=req.mowyWorkspace.userId+':performance:'+JSON.stringify([accountId,period,since||'',until||''])
+   const result=await cachedMetaResponse(cacheKey,45000,async()=>{
+    const url=new URL('https://graph.facebook.com/v27.0/act_'+accountId+'/insights')
+    url.search=new URLSearchParams({level:'account',...(period==='custom'?{time_range:JSON.stringify({since,until})}:{date_preset:period}),fields:'account_name,account_currency,date_start,date_stop,spend,actions,impressions,clicks,ctr,cpc,cpm'})
+    const r=await fetch(url,{headers:{Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)}),d=await r.json().catch(()=>({}))
+    if(!r.ok||!Array.isArray(d.data))throw Object.assign(new Error('Meta insights failed'),{metaError:d.error,statusCode:r.status})
+    const row=d.data[0]||{},actions=row.actions||[],count=t=>Number(actions.find(x=>x.action_type===t)?.value||0)
+    const campaigns=[];let after='',pages=0
+    const insightPeriod=period==='custom'?'.time_range('+JSON.stringify({since,until})+')':'.date_preset('+period+')'
+    do{
+      const cu=new URL('https://graph.facebook.com/v27.0/act_'+accountId+'/campaigns')
+      cu.search=new URLSearchParams({fields:'id,name,effective_status,insights'+insightPeriod+'{spend,impressions,clicks,ctr,cpc,cpm,actions}',effective_status:JSON.stringify(['ACTIVE']),limit:'100',...(after?{after}:{})})
+      const cr=await fetch(cu,{headers:{Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)}),cd=await cr.json().catch(()=>({}))
+      if(!cr.ok||!Array.isArray(cd.data))throw Object.assign(new Error('Meta campaign insights failed'),{metaError:cd.error,statusCode:cr.status})
+      for(const c of cd.data){const v=c.insights?.data?.[0]||{},impressions=Number(v.impressions||0),clicks=Number(v.clicks||0),spend=Number(v.spend||0),leads=Number(v.actions?.find(a=>a.action_type==='lead')?.value||0);campaigns.push({id:c.id,name:c.name,status:c.effective_status,spend,impressions,clicks,ctr:impressions?clicks/impressions*100:null,cpc:clicks?spend/clicks:null,cpm:impressions?spend/impressions*1000:null,leads,cpl:leads?spend/leads:null})}
+      after=cd.paging?.next?cd.paging?.cursors?.after:null
+      pages++
+    }while(after&&pages<5)
+    return {spend:Number(row.spend||0),currency:row.account_currency||null,impressions:Number(row.impressions||0),clicks:Number(row.clicks||0),ctr:Number(row.impressions)>0?Number(row.clicks||0)/Number(row.impressions)*100:null,leads:count('lead'),conversations:count('onsite_conversion.messaging_conversation_started_7d'),start:row.date_start,end:row.date_stop,account:row.account_name||accountId,campaigns,updatedAt:new Date().toISOString()}
+   })
+   res.set('Cache-Control','no-store').json(result)
+  }catch(error){return metaErrorResponse(res,'meta_performance_failed',error,'Laporan Meta belum dapat dimuat. Periksa koneksi dan izin baca iklan.')}
 })
-app.get('/api/meta-ads/balance', authenticatedUser, async (req, res) => {
-  if (!requireOwner(req,res))return
-  let config;try{config=await metaConfig(req)}catch{return res.status(503).json({error:'Koneksi Meta perlu diperiksa di Data Bisnis.'})}
+app.get('/api/meta-ads/balance',authenticatedUser,workspaceRateLimit('meta-balance',30,60000),async(req,res)=>{
+  if(!requireOwner(req,res))return
+  let config
+  try{config=await metaConfig(req)}catch{return res.status(503).json({error:'Koneksi Meta perlu diperiksa di Data Client.'})}
   const {accountId,accessToken}=config
-  if (!/^\d+$/.test(accountId) || !accessToken) return res.status(503).json({ error: 'Hubungkan akun Meta Ads brand ini di Data Bisnis.' })
-  try {
-    const url = new URL(`https://graph.facebook.com/v27.0/act_${accountId}`)
-    url.searchParams.set('fields', 'name,account_id,balance,amount_spent,spend_cap,currency,account_status')
-    
-    const response = await fetch(url, { headers: { Accept: 'application/json', Authorization:'Bearer '+accessToken }, signal: AbortSignal.timeout(12000) })
-    const result = await response.json().catch(() => ({}))
-    if (!response.ok || result.error) {
-      console.warn('Meta Ads balance request failed:', result.error?.code || response.status)
-      return res.status(502).json({ error: 'Meta Ads tidak mengizinkan pembacaan akun. Periksa token, ID akun, dan izin ads_read.' })
-    }
-    const currency = String(result.currency || 'IDR')
-    const decimals = new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits
-    const amount = value => Number.isFinite(Number(value)) ? Number(value) / (10 ** decimals) : null
-    const spendCap = amount(result.spend_cap)
-    const amountSpent = amount(result.amount_spent)
-    res.set('Cache-Control', 'no-store').json({ accountId: result.account_id, accountName: result.name || '', currency, spendCap, amountSpent, remainingLimit: spendCap > 0 && amountSpent !== null ? Math.max(0, spendCap - amountSpent) : null, balanceDue: amount(result.balance), accountStatus: result.account_status, updatedAt: new Date().toISOString() })
-  } catch (error) {
-    console.error('Meta Ads balance fetch failed:', error instanceof Error ? error.message : 'unknown')
-    res.status(502).json({ error: 'Saldo Meta Ads gagal diperbarui. Periksa koneksi gateway.' })
-  }
+  if(!/^\\d+$/.test(accountId)||!accessToken)return res.status(503).json({error:'Hubungkan akun Meta Ads di Data Client.'})
+  try{
+   const result=await cachedMetaResponse(req.mowyWorkspace.userId+':balance:'+accountId,60000,async()=>{
+    const url=new URL('https://graph.facebook.com/v27.0/act_'+accountId)
+    url.searchParams.set('fields','name,account_id,balance,amount_spent,spend_cap,currency,account_status')
+    const response=await fetch(url,{headers:{Accept:'application/json',Authorization:'Bearer '+accessToken},signal:AbortSignal.timeout(12000)})
+    const body=await response.json().catch(()=>({}))
+    if(!response.ok||body.error)throw Object.assign(new Error('Meta balance failed'),{metaError:body.error,statusCode:response.status})
+    const currency=String(body.currency||'IDR')
+    const decimals=new Intl.NumberFormat('en',{style:'currency',currency}).resolvedOptions().maximumFractionDigits
+    const amount=value=>Number.isFinite(Number(value))?Number(value)/(10**decimals):null
+    const spendCap=amount(body.spend_cap),amountSpent=amount(body.amount_spent)
+    return {accountId:body.account_id,accountName:body.name||'',currency,spendCap,amountSpent,remainingLimit:spendCap>0&&amountSpent!==null?Math.max(0,spendCap-amountSpent):null,balanceDue:amount(body.balance),accountStatus:body.account_status,updatedAt:new Date().toISOString()}
+   })
+   res.set('Cache-Control','no-store').json(result)
+  }catch(error){return metaErrorResponse(res,'meta_balance_failed',error,'Saldo Meta Ads gagal diperbarui. Periksa koneksi gateway.')}
 })
-
 app.put('/api/knowledge/documents', authenticatedUser, async (req, res) => {
   if (!requireKnowledgeOwner(req, res)) return
   const input = req.body?.documents
@@ -1424,7 +1523,7 @@ function cleanExtractedText(value) {
 
 }
 
-app.post('/api/knowledge/sync', authenticatedUser, async (req, res) => {
+app.post('/api/knowledge/sync', authenticatedUser, workspaceRateLimit('knowledge-sync',2,60000), async (req, res) => {
   if (!requireKnowledgeOwner(req, res)) return
   if (!currentWorkspace().knowledgeDocuments.length) return res.status(400).json({ error: 'Unggah dan simpan dokumen terlebih dahulu.' })
   try {
@@ -1878,7 +1977,7 @@ async function handleIncomingMessage(message) {
   }
 }
 
-app.post('/api/ai/test', authenticatedUser, async (req, res) => {
+app.post('/api/ai/test', authenticatedUser, workspaceRateLimit('ai-test',6,60000), async (req, res) => {
   if (!requireKnowledgeOwner(req, res)) return
   const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 4000) : ''
   if (!message) return res.status(400).json({ error: 'Tulis pesan contoh terlebih dahulu.' })
