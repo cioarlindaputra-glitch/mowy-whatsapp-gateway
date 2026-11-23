@@ -1981,7 +1981,7 @@ async function handleIncomingMessage(message) {
   const history = recentConversationHistory(jid, message.key.id)
   const answer = await generateAIReply(text, knowledge, behavior, workspace.knowledgeDocuments, config.media, history)
   if (!answer) { console.warn(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'empty_ai_answer' })); return }
-  if (/^\\s*\\[\\[MOWY_IGNORE\\]\\]\\s*$/i.test(answer)) { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'out_of_scope_or_unclear' })); return }
+  if (String(answer).trim().toUpperCase() === '[[MOWY_IGNORE]]') { console.info(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'out_of_scope_or_unclear' })); return }
   const replyDelay = aiReplyDelayMs(answer, behavior)
   try { await workspace.socket.sendPresenceUpdate('composing', jid) } catch {}
   await new Promise(resolve => setTimeout(resolve, replyDelay))
