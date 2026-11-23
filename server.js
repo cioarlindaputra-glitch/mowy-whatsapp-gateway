@@ -41,7 +41,7 @@ function workspacePaths(userId) {
 async function loadWorkspace(userId) {
   if (!workspaceStates.has(userId)) workspaceStates.set(userId, (async () => {
     const files = workspacePaths(userId)
-    const state = { userId, files, socket: null, connectionState: 'disconnected', qrDataUrl: null, lastError: null, starting: false, seenMessages: new Map(), chatQueues: new Map(), optedOutJids: new Set(), knowledgeDocuments: [], inboxChats: new Map(), leads: new Map(), appointments: new Map(), businessMedia: new Map(), writes: { inbox: Promise.resolve(), leads: Promise.resolve(), appointments: Promise.resolve(), media: Promise.resolve() } }
+    const state = { userId, files, socket: null, connectionState: 'disconnected', qrDataUrl: null, lastError: null, starting: false, disconnecting: false, seenMessages: new Map(), chatQueues: new Map(), optedOutJids: new Set(), knowledgeDocuments: [], inboxChats: new Map(), leads: new Map(), appointments: new Map(), businessMedia: new Map(), writes: { inbox: Promise.resolve(), leads: Promise.resolve(), appointments: Promise.resolve(), media: Promise.resolve() } }
     async function readJson(file) { try { return JSON.parse(await fs.readFile(file, 'utf8')) } catch { return null } }
     const [knowledge, inbox, leadData, appointmentData, media] = await Promise.all([readJson(files.knowledge), readJson(files.inbox), readJson(files.leads), readJson(files.appointments), readJson(files.media)])
     state.knowledgeDocuments = Array.isArray(knowledge?.documents) ? knowledge.documents : []
@@ -1618,8 +1618,22 @@ app.all('/api/brand-whatsapp/:action', authenticatedUser, async (req,res)=>{
   res.set('Cache-Control','no-store')
   if(req.method==='POST'&&req.params.action==='connect'){
     if(!ws.starting&&!['connected','connecting','qr'].includes(ws.connectionState)){
+      ws.disconnecting=false
       await fs.mkdir(ws.files.sessionDir,{recursive:true})
       workspaceStorage.run(ws,()=>startSocket(ws)).catch(()=>{ws.starting=false;ws.connectionState='error'})
+    }
+  }else if(req.method==='POST'&&req.params.action==='disconnect'){
+    try {
+      ws.disconnecting=true
+      ws.starting=false
+      ws.qrDataUrl=null
+      if(ws.socket)ws.socket.end(undefined)
+      ws.socket=null
+      ws.connectionState='disconnected'
+      await fs.rm(ws.files.sessionDir,{recursive:true,force:true})
+    } catch {
+      ws.disconnecting=false
+      return res.status(500).json({error:'Gagal memutus sesi WhatsApp. Coba lagi.'})
     }
   }else if(!(req.method==='GET'&&req.params.action==='status'))return res.sendStatus(405)
   if(req.method==='GET' && ws.connectionState==='disconnected' && !ws.socket && !ws.starting){
@@ -1684,24 +1698,33 @@ async function startSocket(workspace = currentWorkspace()) {
     markOnlineOnConnect: false, syncFullHistory: false,
     connectTimeoutMs: 90_000, defaultQueryTimeoutMs: 120_000, keepAliveIntervalMs: 20_000, retryRequestDelayMs: 500,
   })
-  workspace.socket.ev.on('creds.update', saveCreds)
-  workspace.socket.ev.on('connection.update', (update) => workspaceStorage.run(workspace, async () => {
+  const socket = workspace.socket
+  socket.ev.on('creds.update', saveCreds)
+  socket.ev.on('connection.update', (update) => workspaceStorage.run(workspace, async () => {
     if (update.qr) {
       workspace.qrDataUrl = await QRCode.toDataURL(update.qr, { width: 280, margin: 2 })
 
       workspace.connectionState = 'qr'
     }
     if (update.connection === 'open') {
+      workspace.disconnecting = false
       workspace.connectionState = 'connected'
       workspace.qrDataUrl = null
       workspace.lastError = null
       workspace.starting = false
     }
     if (update.connection === 'close') {
+      if (workspace.socket !== socket && !workspace.disconnecting) return
       const status = update.lastDisconnect?.error ? new Boom(update.lastDisconnect.error).output?.statusCode : null
       workspace.socket = null
       workspace.qrDataUrl = null
       workspace.starting = false
+      if (workspace.disconnecting) {
+        workspace.disconnecting = false
+        workspace.connectionState = 'disconnected'
+        await fs.rm(workspace.files.sessionDir, { recursive: true, force: true })
+        return
+      }
       if (status === DisconnectReason.loggedOut) {
         workspace.connectionState = 'disconnected'
         workspace.lastError = 'Sesi keluar dari WhatsApp. Hubungkan ulang dan pindai QR baru.'
@@ -1716,7 +1739,7 @@ async function startSocket(workspace = currentWorkspace()) {
       }
     }
   }))
-  workspace.socket.ev.on('messages.upsert', ({ messages, type }) => workspaceStorage.run(workspace, () => {
+  socket.ev.on('messages.upsert', ({ messages, type }) => workspaceStorage.run(workspace, () => {
     if (type !== 'notify') return
     for (const message of messages) {
       if (!message.message || message.key.remoteJid?.endsWith('@g.us') || message.key.remoteJid === 'status@broadcast') continue
