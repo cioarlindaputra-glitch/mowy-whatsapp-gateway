@@ -1908,6 +1908,18 @@ async function saveIncomingVideo(message, video) {
   }
 }
 
+function aiReplyDelayMs(answer, behavior = {}) {
+  const boundedSeconds = (value, fallback) => {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? Math.min(8, Math.max(3, parsed)) : fallback
+  }
+  const minimum = boundedSeconds(behavior.responseDelayMinSeconds, 3)
+  const maximum = Math.max(minimum, boundedSeconds(behavior.responseDelayMaxSeconds, 8))
+  const characterCount = Array.from(String(answer || '')).length
+  const progress = Math.min(1, characterCount / 500)
+  return Math.round((minimum + (maximum - minimum) * progress) * 1000)
+}
+
 async function handleIncomingMessage(message) {
   const photo=inboundImage(message), video=inboundVideo(message)
   const workspace = currentWorkspace()
@@ -1968,6 +1980,10 @@ async function handleIncomingMessage(message) {
   const history = recentConversationHistory(jid, message.key.id)
   const answer = await generateAIReply(text, knowledge, behavior, workspace.knowledgeDocuments, config.media, history)
   if (!answer) { console.warn(JSON.stringify({ event: 'incoming_skipped', jid, reason: 'empty_ai_answer' })); return }
+  const replyDelay = aiReplyDelayMs(answer, behavior)
+  try { await workspace.socket.sendPresenceUpdate('composing', jid) } catch {}
+  await new Promise(resolve => setTimeout(resolve, replyDelay))
+  try { await workspace.socket.sendPresenceUpdate('paused', jid) } catch {}
   const sent = await workspace.socket.sendMessage(message.key.remoteJid, { text: answer })
   console.info(JSON.stringify({ event: 'auto_reply_sent', characters: answer.length }))
   await saveInboxMessage({ jid, name: message.pushName, text: answer, fromMe: true, timestamp: Date.now(), id: sent?.key?.id })
