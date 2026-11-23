@@ -1426,7 +1426,7 @@ app.post('/api/meta-ads/connection',authenticatedUser,workspaceRateLimit('meta-c
 app.post('/api/meta-ads/disconnect',authenticatedUser,workspaceRateLimit('meta-connect',10,60000),async(req,res)=>{try{await writeMeta(req.mowyWorkspace,{disabled:true});clearMetaCache(req.mowyWorkspace.userId);res.json({connected:false})}catch{res.status(503).json({error:'Koneksi gagal dilepas.'})}})
 app.get('/api/meta-ads/performance',authenticatedUser,workspaceRateLimit('meta-performance',30,60000),async(req,res)=>{
   const period=req.query.period||'this_month',since=req.query.since,until=req.query.until
-  const validDate=x=>typeof x==='string'&&/^\\d{4}-\\d{2}-\\d{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&new Date(x).toISOString().slice(0,10)===x
+  const validDate=x=>typeof x==='string'&&/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&new Date(x).toISOString().slice(0,10)===x
   const todayJakarta=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Jakarta'})
   if(period==='custom'&&(!validDate(since)||!validDate(until)||since>until||until>todayJakarta||Date.parse(until)-Date.parse(since)>90*86400000))return res.status(400).json({error:'Rentang tanggal tidak valid atau melebihi 90 hari.'})
   if(!['custom','today','last_7d','last_30d','this_month','last_month'].includes(period))return res.status(400).json({error:'Periode tidak valid.'})
