@@ -41,11 +41,12 @@ function workspacePaths(userId) {
 async function loadWorkspace(userId) {
   if (!workspaceStates.has(userId)) workspaceStates.set(userId, (async () => {
     const files = workspacePaths(userId)
-    const state = { userId, files, socket: null, connectionState: 'disconnected', qrDataUrl: null, lastError: null, starting: false, disconnecting: false, seenMessages: new Map(), chatQueues: new Map(), optedOutJids: new Set(), knowledgeDocuments: [], inboxChats: new Map(), leads: new Map(), appointments: new Map(), businessMedia: new Map(), writes: { inbox: Promise.resolve(), leads: Promise.resolve(), appointments: Promise.resolve(), media: Promise.resolve() } }
+    const state = { userId, files, socket: null, connectionState: 'disconnected', qrDataUrl: null, lastError: null, starting: false, disconnecting: false, historySync: { status: 'not_started', chats: 0, messages: 0, contacts: 0, progress: null, updatedAt: null }, seenMessages: new Map(), chatQueues: new Map(), optedOutJids: new Set(), knowledgeDocuments: [], inboxChats: new Map(), leads: new Map(), appointments: new Map(), businessMedia: new Map(), writes: { inbox: Promise.resolve(), leads: Promise.resolve(), appointments: Promise.resolve(), media: Promise.resolve() } }
     async function readJson(file) { try { return JSON.parse(await fs.readFile(file, 'utf8')) } catch { return null } }
     const [knowledge, inbox, leadData, appointmentData, media] = await Promise.all([readJson(files.knowledge), readJson(files.inbox), readJson(files.leads), readJson(files.appointments), readJson(files.media)])
     state.knowledgeDocuments = Array.isArray(knowledge?.documents) ? knowledge.documents : []
     if (Array.isArray(inbox?.chats)) for (const chat of inbox.chats) if (typeof chat?.jid === 'string' && Array.isArray(chat.messages)) state.inboxChats.set(chat.jid, chat)
+    if (inbox?.historySync && typeof inbox.historySync === 'object') state.historySync = { ...state.historySync, ...inbox.historySync }
     if (Array.isArray(leadData?.leads)) for (const lead of leadData.leads) if (typeof lead?.id === 'string' && typeof lead?.jid === 'string') state.leads.set(lead.id, lead)
     if (Array.isArray(appointmentData?.appointments)) for (const appointment of appointmentData.appointments) if (typeof appointment?.id === 'string') state.appointments.set(appointment.id, appointment)
     if (Array.isArray(media?.files)) for (const file of media.files) if (typeof file?.id === 'string') state.businessMedia.set(file.id, file)
@@ -361,7 +362,7 @@ function requireAppointmentOwner(req, res) {
 
 function persistInbox() {
   const workspace = currentWorkspace(), file = workspace.files.inbox
-  const snapshot = { ownerUserId: workspace.userId, chats: [...inboxChats.values()] }
+  const snapshot = { ownerUserId: workspace.userId, chats: [...inboxChats.values()], historySync: workspace.historySync }
 
   workspace.writes.inbox = workspace.writes.inbox.catch(() => {}).then(async () => {
     await fs.mkdir(path.dirname(file), { recursive: true })
@@ -458,6 +459,56 @@ async function saveInboxMessage({ jid, name, phone, text, fromMe = false, timest
   inboxChats.set(jid, chat)
   const ordered = [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
   while (ordered.length > 100) inboxChats.delete(ordered.pop().jid)
+  await persistInbox()
+}
+
+
+async function saveHistoricalBatch(workspace, { chats = [], contacts = [], messages = [], progress, isLatest }) {
+  const contactNames = new Map()
+  for (const item of contacts) {
+    const jid = String(item?.id || item?.jid || '')
+    const name = String(item?.name || item?.notify || item?.verifiedName || '').trim()
+    if (jid && name) contactNames.set(jid, name.slice(0, 100))
+  }
+  const chatNames = new Map()
+  for (const item of chats) {
+    const jid = String(item?.id || item?.jid || '')
+    const name = String(item?.name || item?.subject || contactNames.get(jid) || '').trim()
+    if (jid && name) chatNames.set(jid, name.slice(0, 100))
+  }
+  let imported = 0
+  for (const message of messages) {
+    const jid = String(message?.key?.remoteJid || '')
+    if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast' || !message?.message) continue
+    const id = String(message?.key?.id || '')
+    const text = extractText(message)
+    if (!id || !text) continue
+    const chat = workspace.inboxChats.get(jid) || { jid, name: '', unread: 0, updatedAt: 0, messages: [] }
+    if (chat.messages.some(row => row.id === id)) continue
+    const phone = await resolveMessagePhone(message, workspace.socket)
+    if (phone) chat.phone = phone
+    const name = chatNames.get(jid) || contactNames.get(jid) || message.pushName || ''
+    if (name && !message.key.fromMe) chat.name = String(name).slice(0, 100)
+    const rawTimestamp = Number(message.messageTimestamp?.low ?? message.messageTimestamp ?? 0)
+    const timestamp = rawTimestamp > 0 ? rawTimestamp * 1000 : Date.now()
+    chat.updatedAt = Math.max(Number(chat.updatedAt || 0), timestamp)
+    chat.messages.push({ id: id.slice(0, 120), text: text.slice(0, 2000), fromMe: Boolean(message.key.fromMe), timestamp })
+    chat.messages.sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+    if (chat.messages.length > 100) chat.messages.splice(0, chat.messages.length - 100)
+    workspace.inboxChats.set(jid, chat)
+    imported += 1
+  }
+  const ordered = [...workspace.inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+  while (ordered.length > 100) workspace.inboxChats.delete(ordered.pop().jid)
+  workspace.historySync = {
+    ...workspace.historySync,
+    status: isLatest || Number(progress) >= 100 ? 'complete' : (imported || chats.length || contacts.length ? 'syncing' : workspace.historySync.status),
+    chats: Math.max(Number(workspace.historySync.chats || 0), workspace.inboxChats.size),
+    messages: Number(workspace.historySync.messages || 0) + imported,
+    contacts: Math.max(Number(workspace.historySync.contacts || 0), contacts.length),
+    progress: Number.isFinite(Number(progress)) ? Number(progress) : workspace.historySync.progress,
+    updatedAt: Date.now()
+  }
   await persistInbox()
 }
 
@@ -1020,7 +1071,7 @@ app.get('/api/knowledge/documents', authenticatedUser, async (req, res) => {
 
 app.get('/api/inbox', authenticatedUser, (req, res) => {
   if (!requireInboxOwner(req, res)) return
-  res.json({ chats: [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)).map(inboxSummary) })
+  res.json({ chats: [...inboxChats.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)).map(inboxSummary), historySync: currentWorkspace().historySync })
 })
 
 app.get('/api/leads', authenticatedUser, async (req, res) => {
@@ -1609,7 +1660,7 @@ app.get('/api/brand-workspace', authenticatedUser, async (req,res)=>{
   if(!profile)return res.sendStatus(404)
   const id=profile.workspaceId||profile.brand
   const ws=await loadWorkspace(req.mowyUser.id+'-brand-'+createHash('sha256').update(String(id)).digest('hex'))
-  res.set('Cache-Control','no-store').json({brand:profile.brand,chats:[...ws.inboxChats.values()].map(c=>({...inboxSummary(c),messages:c.messages})),leads:[...ws.leads.values()],appointments:[...ws.appointments.values()]})
+  res.set('Cache-Control','no-store').json({brand:profile.brand,chats:[...ws.inboxChats.values()].map(c=>({...inboxSummary(c),messages:c.messages})),leads:[...ws.leads.values()],appointments:[...ws.appointments.values()],historySync:ws.historySync})
 })
 app.all('/api/brand-whatsapp/:action', authenticatedUser, async (req,res)=>{
   const brand=(req.mowyUser.user_metadata?.mowy_brand_profiles||[]).find(b=>b.brand===req.query.brand)
@@ -1640,14 +1691,14 @@ app.all('/api/brand-whatsapp/:action', authenticatedUser, async (req,res)=>{
     const saved=await fs.access(path.join(ws.files.sessionDir,'creds.json')).then(()=>true,()=>false)
     if(saved && !ws.starting)workspaceStorage.run(ws,()=>startSocket(ws)).catch(()=>{ws.starting=false;ws.connectionState='error'})
   }
-  res.json({brand:brand.brand,state:ws.connectionState,qrDataUrl:ws.qrDataUrl,phone:ws.socket?.user?.id?.split(':')[0]||null})
+  res.json({brand:brand.brand,state:ws.connectionState,qrDataUrl:ws.qrDataUrl,phone:ws.socket?.user?.id?.split(':')[0]||null,historySync:ws.historySync})
 })
 
 app.get('/api/whatsapp/status', authenticatedUser, (req, res) => {
   if (!requireOwner(req, res)) return
   const workspace = req.mowyWorkspace
   if (!workspace.socket && workspace.connectionState === 'disconnected') fs.access(path.join(workspace.files.sessionDir, 'creds.json')).then(() => workspaceStorage.run(workspace, () => startSocket(workspace))).catch(() => {})
-  res.json({ state: workspace.connectionState, qrDataUrl: workspace.qrDataUrl, phone: workspace.socket?.user?.id?.split(':')[0] || null, error: workspace.lastError })
+  res.json({ state: workspace.connectionState, qrDataUrl: workspace.qrDataUrl, phone: workspace.socket?.user?.id?.split(':')[0] || null, error: workspace.lastError, historySync: workspace.historySync })
 })
 
 app.post('/api/whatsapp/connect', authenticatedUser, async (req, res) => {
@@ -1694,12 +1745,14 @@ async function startSocket(workspace = currentWorkspace()) {
   let version
   try { ({ version } = await fetchLatestBaileysVersion()) } catch (error) { console.warn('Fetching latest WA Web version failed, using bundled version:', error instanceof Error ? error.message : 'unknown') }
   workspace.socket = makeWASocket({
-    auth: state, version, browser: Browsers.ubuntu('Chrome'),
-    markOnlineOnConnect: false, syncFullHistory: false,
+    auth: state, version, browser: Browsers.macOS('Desktop'),
+    markOnlineOnConnect: false, syncFullHistory: true,
     connectTimeoutMs: 90_000, defaultQueryTimeoutMs: 120_000, keepAliveIntervalMs: 20_000, retryRequestDelayMs: 500,
   })
   const socket = workspace.socket
   socket.ev.on('creds.update', saveCreds)
+  if (!state.creds.registered) workspace.historySync = { ...workspace.historySync, status: 'waiting', chats: 0, messages: 0, contacts: 0, progress: null, updatedAt: Date.now() }
+  socket.ev.on('messaging-history.set', (payload) => workspaceStorage.run(workspace, () => saveHistoricalBatch(workspace, payload || {}).catch(error => console.error('Saving WhatsApp history failed:', error instanceof Error ? error.message : 'unknown'))))
   socket.ev.on('connection.update', (update) => workspaceStorage.run(workspace, async () => {
     if (update.qr) {
       workspace.qrDataUrl = await QRCode.toDataURL(update.qr, { width: 280, margin: 2 })
@@ -1712,6 +1765,7 @@ async function startSocket(workspace = currentWorkspace()) {
       workspace.qrDataUrl = null
       workspace.lastError = null
       workspace.starting = false
+      if (workspace.historySync.status === 'waiting') workspace.historySync = { ...workspace.historySync, status: 'syncing', updatedAt: Date.now() }
     }
     if (update.connection === 'close') {
       if (workspace.socket !== socket && !workspace.disconnecting) return
